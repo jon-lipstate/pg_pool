@@ -1,0 +1,5 @@
+*.exe
+*.pdb
+vendor/
+.env
+ols.json
