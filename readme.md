@@ -1,5 +1,4 @@
 # pg-pool
 
-clone into vendor/
 
-https://github.com/laytan/odin-postgresql
+sudo apt-get install libpq-dev

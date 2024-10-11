@@ -1,5 +1,7 @@
 *.exe
 *.pdb
-vendor/
+vendor/odin-postgresql/
 .env
 ols.json
+pg_pool
+.vscode

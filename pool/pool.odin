@@ -35,6 +35,7 @@ Connection_Pool :: struct {
 	max_size:           int,
 	max_life_time:      time.Duration,
 	max_idle_time:      time.Duration,
+	text_mode:          bool, // only text-mode atm!
 }
 
 Connection :: struct {
@@ -43,12 +44,44 @@ Connection :: struct {
 	last_active: time.Time,
 }
 
+// Basic_Types :: union {
+// 	^bool,
+// 	// u8,
+// 	// u16,
+// 	// u32,
+// 	// u64,
+// 	^uint,
+// 	// i8,
+// 	// i16,
+// 	// i32,
+// 	// i64,
+// 	^int,
+// 	^f32,
+// 	^f64,
+// 	^rune,
+// 	^string,
+// 	^time.Time,
+// 	^time.DateTime,
+// 	^time.Date,
+// 	^[]bool,
+// 	^[]byte, // bytea
+// 	^[]uint,
+// 	^[]int,
+// 	^[]f32,
+// 	^[]f64,
+// 	^[]string,
+// }
 
+// Postgres integers: 
+//
+// `INTEGER: i32`, `BIGINT: i64`, `SMALLINT: i16`. There are NO `uint` types. 
+//
 init :: proc(
 	connection_string: string,
 	min_connections: uint = 4,
 	max_connections: uint = 64,
 	max_idle_mins: uint = 5,
+	text_mode := true,
 ) -> (
 	ok: bool,
 ) {
@@ -165,6 +198,7 @@ acquire :: proc() -> ^Connection {
 		}
 
 		append(&POOL.active_connections, cnx)
+		cnx.last_active = time.now()
 		return cnx
 	}
 
@@ -183,6 +217,7 @@ acquire :: proc() -> ^Connection {
 		sync.cond_wait(&POOL.cond, &POOL.lock)
 	}
 	cnx := pop(&POOL.idle_connections)
+	cnx.last_active = time.now()
 	append(&POOL.active_connections, cnx)
 
 	return cnx
@@ -215,8 +250,9 @@ create_new_connection :: proc(allocator := context.allocator) -> (cnx: ^Connecti
 
 	cnx = new(Connection, allocator)
 	cnx^ = {
-		cnx        = pq_conn,
-		created_at = time.now(),
+		cnx         = pq_conn,
+		created_at  = time.now(),
+		last_active = time.now(),
 	}
 
 	return cnx, true
@@ -271,8 +307,7 @@ validate_connection :: proc(cnx: ^Connection) -> bool {
 health_check :: proc() {
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
-
-	for cnx in POOL.idle_connections {
+	#reverse for cnx in POOL.idle_connections {
 		time_elapsed := time.since(cnx.last_active)
 		if time_elapsed > POOL.max_idle_time {
 			destroy_connection(cnx)
@@ -313,7 +348,6 @@ rebalance :: proc() -> (ok: bool) {
 
 
 exec :: proc(sql: string, arguments: ..any) -> (result: pq.Result, ok: bool) {
-	// Acquire a connection from the pool
 	cnx := acquire()
 	if cnx == nil {
 		fmt.eprintln("Failed to acquire a connection from the pool")
@@ -338,12 +372,50 @@ exec :: proc(sql: string, arguments: ..any) -> (result: pq.Result, ok: bool) {
 	return result, true
 }
 
+prepare :: proc(cnx: ^Connection, name: string, sql: string) -> (ok: bool) {
+	c_stmt_name := strings.clone_to_cstring(name, context.temp_allocator)
+	c_sql := strings.clone_to_cstring(sql, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+
+	res := pq.prepare(cnx.cnx, c_stmt_name, c_sql, 2, nil)
+	if pq.result_status(res) != pq.Exec_Status.Command_OK {
+		fmt.println("Preparation failed:", pq.error_message(cnx.cnx))
+		pq.clear(res)
+		return false
+	}
+	pq.clear(res)
+	return true
+}
+
+// exec_prepared :: proc(cnx: ^Connection, name: string, args: ..any) -> (res: pq.Result, ok: bool) {
+// 	c_stmt_name := strings.clone_to_cstring(name, context.temp_allocator)
+// 	defer free_all(context.temp_allocator)
+
+// 	param_values := []^byte{}
+// 	for param in params {
+// 		c_param := strings.clone_to_cstring(param, context.temp_allocator)
+// 		append(&param_values, c_param)
+// 	}
+
+// 	res := pq.exec_prepared(cnx.cnx, c_stmt_name, len(param_values), param_values, nil, nil, .Text)
+
+// 	if pq.result_status(res) != pq.Exec_Status.Tuples_OK {
+// 		fmt.println("Execution failed:", pq.error_message(cnx.cnx))
+// 		pq.clear(res)
+// 		return nil, false
+// 	}
+
+// 	return res, true
+// }
+
+
 Rows :: struct {
 	result:       pq.Result,
-	conn:         ^Connection,
+	cnx:          ^Connection,
 	current_row:  int,
 	// columns:     []Column_Metadata,
 	column_count: int,
+	row_count:    int,
 }
 Column_Metadata :: struct {
 	name: string,
@@ -369,12 +441,65 @@ query :: proc(sql: string, args: ..any) -> (Rows, bool) {
 	}
 	return Rows {
 			result = result,
-			conn = cnx,
-			current_row = 0,
+			cnx = cnx,
+			current_row = -1,
 			column_count = int(pq.n_fields(result)),
+			row_count = int(pq.n_tuples(result)),
 		},
 		true
 }
+
+// query_bin :: proc(sql: string, args: ..any) -> (Rows, bool) {
+// 	unimplemented("todo - switch to binary execs")
+// 	cnx := acquire()
+// 	if cnx == nil {
+// 		fmt.eprintln("Failed to acquire connection from pool")
+// 		return {}, false
+// 	}
+
+// 	formatted_sql := format_sql_with_args(sql, args, context.temp_allocator)
+// 	c_sql := strings.clone_to_cstring(formatted_sql, context.temp_allocator)
+// 	defer free_all(context.temp_allocator)
+
+// 	param_count := len(args)
+// 	param_values := make([]cstring, param_count, context.temp_allocator)
+// 	param_lengths := make([]int, param_count, context.temp_allocator)
+// 	param_formats := make([]int, param_count, context.temp_allocator)
+
+// 	for i, arg in args {
+// 		param_values[i] = format_sql_argument(arg, context.temp_allocator)
+// SET BIN / TEXT HERE
+// 		param_lengths[i] = len(param_values[i])
+// 		param_formats[i] = 0 // 0 = text, 1 = binary
+// 	}
+
+// 	result_format := 1 
+// 	result := pq.exec_params(
+// 		cnx.cnx,
+// 		c_sql,
+// 		param_count,
+// 		nil,
+// 		param_values,
+// 		param_lengths,
+// 		param_formats,
+// 		result_format, 
+// 	)
+
+// 	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
+// 		release(cnx)
+// 		fmt.eprintln("Query failed:", pq.error_message(cnx.cnx))
+// 		return {}, false
+// 	}
+
+// 	return Rows {
+// 			result = result,
+// 			conn = cnx,
+// 			current_row = 0,
+// 			column_count = int(pq.n_fields(result)),
+// 		},
+// 		true
+// }
+
 
 // fetch_column_metadata :: proc(rows: ^Rows) {
 // 	column_count := int(pq.n_fields(rows.result))
@@ -393,70 +518,98 @@ query :: proc(sql: string, args: ..any) -> (Rows, bool) {
 // }
 
 
-rows_release :: proc(rows: ^Rows) {
+release_query :: proc(rows: ^Rows) {
 	if rows.result != nil {
 		pq.clear(rows.result)
 	}
-	release(rows.conn)
+	release(rows.cnx)
 }
+
+// TODO: should next_row be moved into scan row??
 next_row :: proc(rows: ^Rows) -> (ok: bool) {
-	if i32(rows.current_row) >= pq.n_tuples(rows.result) {
+	if rows.current_row >= rows.row_count - 1 {
 		return false
 	}
 	rows.current_row += 1
 	return true
 }
-scan_row :: proc(
+// Will allocate when T is a [] type, including strings
+scan :: proc(
 	rows: ^Rows,
-	args: ..any,
+	$T: typeid,
+	col: int,
+	row: Maybe(int) = nil,
 	allocator := context.allocator,
 ) -> (
+	val: Maybe(T),
 	ok: bool,
-	did_alloc: bool = false,
-) {
-	context.allocator = allocator
-	if rows.column_count != len(args) {
-		fmt.eprintf("Got %v args, but have %v columns", len(args), rows.column_count)
-		return false, false
+) #optional_ok {
+	target_row := i32(rows.current_row)
+	if row != nil {target_row = i32(row.(int))}
+	// ensure in-bounds:
+	if target_row < 0 || target_row >= i32(rows.row_count) {return nil, false}
+
+	// Check if the column is null
+	if pq.get_is_null(rows.result, i32(rows.current_row), i32(col)) {
+		return nil, true
 	}
-	for arg, i in args {
-		if pq.get_is_null(rows.result, i32(rows.current_row), i32(i)) {
-			switch &a in arg {
-			case:
-				a = nil
-			}
-			continue
-		}
-		n_bytes := int(pq.f_size(rows.result, i32(i)))
-		ptr := pq.get_value(rows.result, i32(rows.current_row), i32(i))
-		buf := ptr[:n_bytes]
-		switch &a in arg {
-		case ^string:
-			a^ = strings.clone(string(buf)) // not sure if i can go straight to str, isnt \0 still there??
-			did_alloc = true
-		case ^uint:
-			assert(n_bytes == 8)
-			a^ = transmute(uint)&buf[0]
-		case ^int:
-			assert(n_bytes == 8)
-			a^ = transmute(int)&buf[0]
-		case ^f64:
-			assert(n_bytes == 8)
-			a^ = transmute(f64)&buf[0]
-		case ^f32:
-			assert(n_bytes == 4)
-			v: [4]u8
-			mem.copy(&v, &buf, 4) // FIXME: this seems retarded 
-			a^ = transmute(f32)v
-		case ^bool:
-			assert(n_bytes == 1)
-			a^ = transmute(bool)ptr[0]
-		case:
-			fmt.eprintln("Unsupported variable type in argument")
-			return false, false
-		}
+
+	// Get the size of the column value
+	n_bytes := int(pq.f_size(rows.result, i32(col)))
+
+	ptr := pq.get_value(rows.result, target_row, i32(col))
+	str := cast(string)cstring(ptr)
+
+	return parse_text(str, T, allocator)
+}
+
+// read text-return value from Postgres
+@(private)
+parse_text :: proc(
+	str: string,
+	$T: typeid,
+	allocator := context.allocator,
+) -> (
+	val: T,
+	ok: bool,
+) #optional_ok {
+	when T == bool {
+		val = str[0] == 't' ? true : false
+		return val, true
 	}
-	return true, did_alloc
+	when T == int {
+		ival, iok := strconv.parse_int(str)
+		if !iok {fmt.panicf("Expected int, got: '%v'.", str)}
+		val = ival
+		return val, true
+	}
+	when T == uint {
+		ival, uok := strconv.parse_uint(str)
+		if !uok {fmt.panicf("Expected uint, got: '%v'.", str)}
+		val = ival
+		return val, true
+	}
+	when T == f32 {
+		fval, fok := strconv.parse_f32(str)
+		if !fok {fmt.panicf("Expected f32, got: '%v'.", str)}
+		val = fval
+		return val, true
+	}
+	when T == f64 {
+		fval, fok := strconv.parse_f64(str)
+		if !fok {fmt.panicf("Expected f64, got: '%v'.", str)}
+		val = fval
+		return val, true
+	}
+	when T == string {
+		val = strings.clone(str, allocator)
+		return val, true
+	}
+
+
+	fmt.println("...")
+	return val, false // Unsupported type, return false for ok
+
 }
 
 @(private)
