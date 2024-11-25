@@ -9,7 +9,7 @@ set :: proc() -> (ok: bool) {
 	file, read_ok := os.read_entire_file(env_file)
 	if !read_ok {return false}
 	defer delete(file)
-	lines := strings.split(string(file), "\n")
+	lines := strings.split(string(file), "\n");defer delete(lines)
 
 	for line in lines {
 		trimmed_line := strings.trim(line, "\r\n \t")
@@ -34,7 +34,6 @@ set :: proc() -> (ok: bool) {
 			fmt.eprintln("Failed to set env var", key, ":", err)
 			return false
 		}
-		// fmt.println("get", key, os.get_env(key))
 	}
 	return true
 }

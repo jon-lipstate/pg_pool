@@ -5,3 +5,5 @@ vendor/odin-postgresql/
 ols.json
 pg_pool
 .vscode
+jwt/
+out/
