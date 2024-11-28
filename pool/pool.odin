@@ -513,7 +513,7 @@ delete_exec_params::proc(ep:^Exec_Params){
 	delete(ep.formats)
 }
 
-to_bytes::proc(v:^$T) -> []byte{
+to_bytes :: proc(v:$T) -> []byte{
 	v:=v
 	p:=&v
 	return (transmute([^]byte)p)[:size_of(T)]
@@ -562,11 +562,12 @@ set_exec_param::proc(ep:^Exec_Params, i:int, param:any) {
 		case []byte:
 			ep.types[i] = OID_BYTEA 
 			append(&ep.values, ..p)
-			ep.lengths[i]=len(p)
+			ep.lengths[i]=i32(len(p))
 		case string:
 			ep.types[i] = OID_TEXT 
-			append(&ep.values, ..p)
-			ep.lengths[i]=len(p)
+			p_bytes:[]byte= raw_data(p)[:len(p)]
+			append(&ep.values, ..p_bytes)
+			ep.lengths[i]=i32(len(p))
 			ep.formats[i] = .Text
 		case:
 			ep.formats[i] = .Text

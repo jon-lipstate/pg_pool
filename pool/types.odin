@@ -22,14 +22,14 @@ TypeCategory :: enum rune {
 	Polymorphic = 'Z', // Polymorphic types (e.g., anyelement, anyarray)
 }
 
-
-OID_BYTEA::17
-OID_TEXT::25
-OID_BIG_INT::20
-OID_INT2::21
-OID_INT4::23
-OID_FLOAT4::700
-OID_FLOAT8::701
+OID_BOOL :: 16
+OID_BYTEA :: 17
+OID_TEXT :: 25
+OID_BIG_INT :: 20
+OID_INT2 :: 21
+OID_INT4 :: 23
+OID_FLOAT4 :: 700
+OID_FLOAT8 :: 701
 
 // @(private)
 // type_cache := map[pq.OID]DB_Type {
