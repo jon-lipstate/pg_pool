@@ -470,25 +470,69 @@ query2 :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) -
 	}
 	context.allocator = cnx.allocator // Use the connection's arena
 
-	// c_sql := strings.clone_to_cstring(formatted_sql)
+	c_sql := strings.clone_to_cstring(sql)
 	n_args:=count_args(sql)
-	for arg in args{
-		switch a in arg {
-			case int, uint:
-				// TODO: Pool Default Policy FOR INTs
-				fmt.println("INT,UINT")
+	ep:= make_exec_params(n_args)
+	defer delete_exec_params(&ep)
+
+	for arg,i in args{
+		set_exec_param(&ep,i,arg)
+	}
+	
+	p_types:= n_args>0 ? &ep.types[0] : nil
+	p_lens:= n_args>0 ? &ep.lengths[0]:nil
+	p_formats:= n_args>0 ?&ep.formats[0]:nil
+	value_ptrs := get_value_ptrs(&ep)
+	p_values := n_args>0 ? transmute([^][^]byte)&value_ptrs[0] : nil
+	//defer if value_ptrs!=nil {delete(value_ptrs)}
+
+	fmt.println("Parameter Details:")
+	for i in 0 ..< len(ep.types) {
+		fmt.printf("  Param %d:\n", i)
+		fmt.printf("    Type (OID): %d\n", ep.types[i])
+		fmt.printf("    Length: %d\n", ep.lengths[i])
+		fmt.printf("    Format: %s\n", ep.formats[i] == .Binary ? "Binary" : "Text")
+		fmt.printf("    Value (hex): %x\n", ep.values[i:i+ int(ep.lengths[i])])
+	}
+
+
+	result := pq.exec_params(cnx.cnx, c_sql, i32(n_args), p_types, p_values, p_lens, p_formats, .Text)
+	fmt.println("After exec")
+
+	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
+		err := db_error_from_msg(cnx)
+		release(cnx)
+		return {}, err
+	}
+	fmt.println("RC")
+
+	row_count := int(pq.n_tuples(result))
+
+	fmt.println("ROW COUNT", row_count)
+	columns := make([]Column_Metadata, int(pq.n_fields(result)))
+
+	for i in 0 ..< len(columns) {
+		column_name := cast(string)(pq.f_name(result, i32(i)))
+		column_oid := pq.f_type(result, i32(i))
+		text_mode := pq.f_format(result, i32(i)) == .Text
+
+		columns[i] = Column_Metadata {
+			name      = column_name,
+			oid       = column_oid,
+			text_mode = text_mode,
 		}
 	}
-	// result := pq.exec_params(cnx.cnx, c_sql, n_args)
+	rows:=Rows {
+		result = result,
+		cnx = cnx,
+		current_row = -1,
+		row_count = row_count,
+		columns = columns,
+	}
+	// fmt.println("Return Rows-Count", rows.row_count)
+	return rows, nil
 
-	// if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
-	// 	err := db_error_from_msg(cnx)
-	// 	release(cnx)
-	// 	return {}, err
-	// }
-
-
-	unimplemented()
+	// unimplemented("end of q2")
 }
 
 Exec_Params :: struct {
@@ -512,11 +556,31 @@ delete_exec_params::proc(ep:^Exec_Params){
 	delete(ep.lengths)
 	delete(ep.formats)
 }
+get_value_ptrs :: proc(ep: ^Exec_Params, allocator:=context.allocator) -> [][^]byte {
+    if ep.values==nil || len(ep.values) == 0 {
+        return nil // No parameters
+    }
 
-to_bytes :: proc(v:$T) -> []byte{
+    buf := make([dynamic][^]byte, len(ep.values),allocator)
+
+    offset := 0
+    for length, i in ep.lengths {
+        buf[i] = &ep.values[offset]
+        offset += int(length)
+    }
+
+    return buf[:]
+}
+
+
+
+to_bytes :: #force_inline proc(v:$T) -> []byte {
+	// NOTE: Must be #force_inline or it needs to allocate
 	v:=v
 	p:=&v
-	return (transmute([^]byte)p)[:size_of(T)]
+	bytes:=(transmute([^]byte)p)[:size_of(T)]
+	// fmt.println("coverted v to bytes",v,bytes)
+	return bytes
 }
 
 set_exec_param::proc(ep:^Exec_Params, i:int, param:any) {
@@ -531,33 +595,35 @@ set_exec_param::proc(ep:^Exec_Params, i:int, param:any) {
 			// ERROR - Type Not Supported
 		case i16:
 			ep.types[i] = OID_INT2 
-			append(&ep.values, ..to_bytes(i16(p)))
+			append(&ep.values, ..to_bytes(i16be(p)))
 			ep.lengths[i]=2
 		case i32:
 			ep.types[i] = OID_INT4 
-			append(&ep.values, ..to_bytes(i32(p)))
+			append(&ep.values, ..to_bytes(i32be(p)))
 			ep.lengths[i]=4
 		case i64:
 			ep.types[i] = OID_BIG_INT
-			append(&ep.values, ..to_bytes(i64(p)))
+			append(&ep.values, ..to_bytes(i64be(p)))
 			ep.lengths[i]=8
 		case int:			
 			if POOL.int_policy == .Int_as_Int4 {
 				ep.types[i] = OID_INT4 
-				append(&ep.values, ..to_bytes(i32(p)))
+				p_bytes:=to_bytes(i32be(p))
+				append(&ep.values, ..p_bytes)
 				ep.lengths[i]=4
 			} else {
 				ep.types[i] = OID_BIG_INT
-				append(&ep.values, ..to_bytes(i64(p)))
+				p_bytes:=to_bytes(i64be(p))
+				append(&ep.values, ..p_bytes)
 				ep.lengths[i]=8
 			}		
 		case f32:
 			ep.types[i] = OID_FLOAT4 
-			append(&ep.values, ..to_bytes(p))
+			append(&ep.values, ..to_bytes(f32be(p)))
 			ep.lengths[i]=4	
 		case f64:
 			ep.types[i] = OID_FLOAT8 
-			append(&ep.values, ..to_bytes(p))
+			append(&ep.values, ..to_bytes(f64be(p)))
 			ep.lengths[i]=8
 		case []byte:
 			ep.types[i] = OID_BYTEA 
@@ -573,7 +639,8 @@ set_exec_param::proc(ep:^Exec_Params, i:int, param:any) {
 			ep.formats[i] = .Text
 
 	}
-	fmt.println("EPV",ep.values)
+	// fmt.println("EP [types], [values], [lens], [formats]",ep.types,ep.values,ep.lengths,ep.formats)
+	// for b in ep.values{fmt.println(b)}
 }
 
 
@@ -978,8 +1045,9 @@ scan :: proc(
 // unimplemented("needs some more thought, cannot pass a maybe, i think..?")
 
 scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T {
-	cols := get_pg_columns(T)
+	cols := get_pg_columns(T) // get `pg:` tagged columns
 	defer delete(cols)
+
 	val := T{}
 	struct_ptr := &val
 
@@ -988,7 +1056,7 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 		for pg_col in cols {
 			if row_col.name == pg_col.name {
 				match = true
-				field_ptr := mem.ptr_offset(struct_ptr, pg_col.field.offset)
+				field_ptr := mem.ptr_offset(transmute([^]u8)struct_ptr, pg_col.field.offset)
 
 				base := runtime.type_info_base(pg_col.field.type)
 				u, is_union := base.variant.(runtime.Type_Info_Union)
@@ -1068,7 +1136,6 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 			fmt.eprintln("No matching field for column:", row_col.name)
 		}
 	}
-
 	return val
 }
 
