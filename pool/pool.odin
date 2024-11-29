@@ -484,31 +484,28 @@ query2 :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) -
 	p_formats:= n_args>0 ?&ep.formats[0]:nil
 	value_ptrs := get_value_ptrs(&ep)
 	p_values := n_args>0 ? transmute([^][^]byte)&value_ptrs[0] : nil
-	//defer if value_ptrs!=nil {delete(value_ptrs)}
+	defer if value_ptrs!=nil {delete(value_ptrs)}
 
-	fmt.println("Parameter Details:")
-	for i in 0 ..< len(ep.types) {
-		fmt.printf("  Param %d:\n", i)
-		fmt.printf("    Type (OID): %d\n", ep.types[i])
-		fmt.printf("    Length: %d\n", ep.lengths[i])
-		fmt.printf("    Format: %s\n", ep.formats[i] == .Binary ? "Binary" : "Text")
-		fmt.printf("    Value (hex): %x\n", ep.values[i:i+ int(ep.lengths[i])])
-	}
+	// fmt.println("Parameter Details:")
+	// for i in 0 ..< len(ep.types) {
+	// 	fmt.printf("  Param %d:\n", i)
+	// 	fmt.printf("    Type (OID): %d\n", ep.types[i])
+	// 	fmt.printf("    Length: %d\n", ep.lengths[i])
+	// 	fmt.printf("    Format: %s\n", ep.formats[i] == .Binary ? "Binary" : "Text")
+	// 	fmt.printf("    Value (hex): %x\n", ep.values[i:i+ int(ep.lengths[i])])
+	// }
 
 
 	result := pq.exec_params(cnx.cnx, c_sql, i32(n_args), p_types, p_values, p_lens, p_formats, .Text)
-	fmt.println("After exec")
 
 	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
 		err := db_error_from_msg(cnx)
 		release(cnx)
 		return {}, err
 	}
-	fmt.println("RC")
 
 	row_count := int(pq.n_tuples(result))
 
-	fmt.println("ROW COUNT", row_count)
 	columns := make([]Column_Metadata, int(pq.n_fields(result)))
 
 	for i in 0 ..< len(columns) {
@@ -529,10 +526,8 @@ query2 :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) -
 		row_count = row_count,
 		columns = columns,
 	}
-	// fmt.println("Return Rows-Count", rows.row_count)
 	return rows, nil
 
-	// unimplemented("end of q2")
 }
 
 Exec_Params :: struct {
@@ -1073,7 +1068,7 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 					if err == nil {
 						str := value.(string)
 						sp := cast(^string)(field_ptr)
-						sp^ = strings.clone(str)
+						sp^ = str
 					}
 				case (runtime.Type_Info_Union):
 					if is_union {
@@ -1184,9 +1179,9 @@ get_pg_columns :: proc(T: typeid) -> []PG_Col {
 
 // Reads text_mode values from Postgres
 //
-// Allocates [] types
+// Allocates [] types incl strings
 @(private)
-parse_text :: proc(str: string, $T: typeid) -> (val: T, err: QueryError) {
+parse_text :: proc(str: string, $T: typeid, allocator:=context.allocator) -> (val: T, err: QueryError) {
 	when T == bool {
 		val = str[0] == 't' ? true : false
 		return val, .None
@@ -1216,12 +1211,12 @@ parse_text :: proc(str: string, $T: typeid) -> (val: T, err: QueryError) {
 		return val, .None
 	}
 	when T == string {
-		val = strings.clone(str)
+		val = strings.clone(str,allocator)
 		return val, .None
 	}
 
-	fmt.println("...")
-	return val, .UnknownType // Unsupported type, return false for ok
+	fmt.println("..?")
+	return val, .UnknownType
 
 }
 

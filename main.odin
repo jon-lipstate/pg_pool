@@ -45,7 +45,6 @@ _main :: proc() {
 	rows, err:= pool.query2("SELECT user_id, first_name, last_name from users WHERE user_id = $1;",args={3})
 	// rows, err:= pool.query2("SELECT 1;")
 	defer pool.release_query(&rows)
-	fmt.println("rows",rows.row_count, err)
 
 	if err == nil {
 		for pool.next_row(&rows) {
