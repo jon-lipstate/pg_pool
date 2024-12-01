@@ -1,7 +1,5 @@
 package pg_pool
 
-main :: proc() {}
-
 import pq "../vendor/odin-postgresql"
 import "base:runtime"
 import "core:fmt"
@@ -13,7 +11,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import dt "core:time/datetime"
-
+import rf "core:reflect"
 
 // Global / Singleton
 POOL: Connection_Pool
@@ -40,16 +38,9 @@ Connection_Pool :: struct {
 	max_life_time:      time.Duration,
 	max_idle_time:      time.Duration,
 	//
-	int_policy: 		Int_Policy, // maybe use bitset for uints, allow int etc??
-	//
 	base_allocator:     mem.Allocator, // what was passed to init
 	cnx_backing:        []byte, // allocated by base_allocator
 	cnx_allocator:      mem.Buddy_Allocator,
-}
-
-Int_Policy::enum { 
-	Int_as_Int4,
-	Int_as_BigInt,
 }
 
 Connection :: struct {
@@ -186,7 +177,6 @@ acquire :: proc(allocation_size: uint = 16 * mem.Kilobyte) -> (^Connection, Erro
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
 
-
 	for len(POOL.idle_connections) > 0 {
 		cnx := pop(&POOL.idle_connections)
 		time_elapsed := time.since(cnx.created_at)
@@ -310,8 +300,8 @@ validate_connection :: proc(cnx: ^Connection) -> bool {
 	// pq.clear(result)
 	return true
 }
-
-health_check :: proc() {
+// Call for periodic pool maintainance 
+maintainance :: proc() {
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
 	#reverse for cnx in POOL.idle_connections {
@@ -322,7 +312,6 @@ health_check :: proc() {
 	}
 	if !rebalance() {fmt.eprintln("failed to rebalance pool after health_check")}
 }
-
 
 resize_pool :: proc(new_min_size: int, new_max_size: int) {
 	sync.lock(&POOL.lock)
@@ -335,6 +324,7 @@ resize_pool :: proc(new_min_size: int, new_max_size: int) {
 }
 @(private)
 rebalance :: proc() -> (ok: bool) {
+	// NOTE: Expects caller to already have locked the pool
 	total_connections := len(POOL.active_connections) + len(POOL.idle_connections)
 
 	downsize: for total_connections > POOL.max_size {
@@ -345,9 +335,7 @@ rebalance :: proc() -> (ok: bool) {
 	}
 	upsize: for i := total_connections; i < POOL.min_size; i += 1 {
 		cnx, ok := create_new_connection()
-		if !ok {
-			return false
-		}
+		if !ok { return false }
 		append(&POOL.idle_connections, cnx)
 	}
 	return true
@@ -392,16 +380,17 @@ query :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, types: []Postgr
 	p_values := n_args>0 ? transmute([^][^]byte)&value_ptrs[0] : nil
 	defer if value_ptrs!=nil {delete(value_ptrs)}
 
+	// offset:=0
 	// fmt.println("Parameter Details:")
 	// for i in 0 ..< len(ep.types) {
 	// 	fmt.printf("  Param %d:\n", i)
 	// 	fmt.printf("    Type (OID): %d\n", ep.types[i])
 	// 	fmt.printf("    Length: %d\n", ep.lengths[i])
 	// 	fmt.printf("    Format: %v\n", ep.formats[i])
-	// 	fmt.printf("    Value (hex): %x\n", ep.values[i:i+ int(ep.lengths[i])])
+	// 	fmt.printf("    Value (hex): %x\n", ep.values[i:offset + int(pd.lengths[i])])
+	// offset+=int(pd.lengths[i])
 	// }
-fmt.println("FIXME: SCAN IS TEXT, CALL QUERY IS BINARY!")
-	result := pq.exec_params(cnx.cnx, c_sql, i32(n_args), p_types, p_values, p_lens, p_formats, .Text)
+	result := pq.exec_params(cnx.cnx, c_sql, i32(n_args), p_types, p_values, p_lens, p_formats, .Text) // FIXME: SWITCH TO BINARY RETURNS
 
 	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
 		err := db_error_from_msg(cnx)
@@ -417,6 +406,7 @@ Exec_Params :: struct {
 	lengths: []i32,
 	formats: []pq.Format,
 }
+@(private)
 make_exec_params::proc(n_params:int,allocator:=context.allocator)->Exec_Params{
 	return Exec_Params{
 		types=make([]pq.OID,n_params,allocator),
@@ -425,6 +415,7 @@ make_exec_params::proc(n_params:int,allocator:=context.allocator)->Exec_Params{
 		formats=make([]pq.Format,n_params,allocator),
 	}
 }
+@(private)
 delete_exec_params::proc(ep:^Exec_Params){
 	assert(ep!=nil)
 	delete(ep.types)
@@ -433,30 +424,46 @@ delete_exec_params::proc(ep:^Exec_Params){
 	delete(ep.formats)
 }
 
-
-
-get_oid :: #force_inline proc(tid:typeid) -> (oid:pq.OID) {
-switch tid {
-	case bool:
-		return OID_BOOL
-	case i16:
-		return OID_INT2
-	case i32:
-		return OID_INT4
-	case int:
-		return OID_INT4
-	case i64:
-		return OID_INT8
-	case f32:
-		return OID_FLOAT4
-	case f64:
-		return OID_FLOAT8
-	// case time.Duration:
-	// case time.Time:
-
-	// 	return 
-}
-	fmt.println("Err - Unknown OID for typeid:", tid) // FIXME: do something better here
+get_oid :: #force_inline proc(tid: typeid) -> (oid: pq.OID) {
+	switch tid {
+		case bool:
+			return OID_BOOL
+		case i16:
+			return OID_INT2
+		case i32, int:
+			return OID_INT4
+		case i64:
+			return OID_INT8
+		case f32:
+			return OID_FLOAT4
+		case f64:
+			return OID_FLOAT8
+		case string:
+			return OID_TEXT
+		case []byte:
+			return OID_BYTEA
+		case time.Time:
+			return OID_TIMESTAMPTZ // OR  OID_TIMESTAMP
+		case time.Date:
+			return OID_DATE
+		case json.Value:
+			return OID_JSONB
+		// case []bool:
+		// 	return OID_ARR_BOOL
+		case []i16:
+			return OID_ARR_INT2
+		case []int, []i32:
+			return OID_ARR_INT4
+		case []i64:
+			return OID_ARR_INT8
+		case []f32:
+			return OID_ARR_FLOAT4
+		case []f64:
+			return OID_ARR_FLOAT8
+		case []string:
+			return OID_ARR_TEXT
+	}
+	fmt.println("Err - Unknown OID for typeid:", tid) // Handle unsupported types gracefully
 	return OID_UNKNOWN
 }
 
@@ -527,7 +534,6 @@ copy_into_buf :: proc(buf:^[dynamic]byte, arg:any, oid:pq.OID, tid: ^Postgres_Ty
 	return
 }
 
-// TODO: optional pass OID to do JSONB or other odd formats?
 set_exec_param :: proc(ep: ^Exec_Params, i: int, param: any, type: ^Postgres_Type = nil) ->(err:Error) {
 	oid:pq.OID
 	format: pq.Format = .Binary
@@ -542,8 +548,6 @@ set_exec_param :: proc(ep: ^Exec_Params, i: int, param: any, type: ^Postgres_Typ
 	ep.lengths[i], err = copy_into_buf(&ep.values, param, oid, type)
 	if err !=nil { return }
 	
-	// fmt.println("EP [types], [values], [lens], [formats]",ep.types,ep.values,ep.lengths,ep.formats)
-	// for b in ep.values{fmt.println(b)}
 	return
 }
 get_value_ptrs :: proc(backing: [dynamic]byte, lens:[]i32, allocator:=context.allocator) -> [][^]byte {
@@ -627,7 +631,7 @@ prepare :: proc(
 
 	return 
 }
-
+@(private)
 extract_oids :: proc(types: []Type_Decl)-> []pq.OID {
 	if len(types)==0 {return nil}
 
@@ -670,6 +674,8 @@ exec_prepared :: proc(
 		writing_type, _ := stmt.arg_types[i].(Postgres_Type)
 		size, err := copy_into_buf(&pd.values, arg, oids[i], &writing_type)
 		if err != nil {return {}, err}
+		pd.lengths[i] = size
+		pd.formats[i]= .Binary
 	}
 
 	p_lens:= n_args>0 ? &pd.lengths[0]:nil
@@ -677,6 +683,17 @@ exec_prepared :: proc(
 	value_ptrs := get_value_ptrs(pd.values, pd.lengths)
 	p_values := n_args>0 ? transmute([^][^]byte)&value_ptrs[0] : nil
 	defer if value_ptrs!=nil {delete(value_ptrs)}
+	fmt.println("VALUES",pd.values)
+	fmt.println("Parameter Details:")
+	offset:=0
+	for i in 0 ..< len(pd.lengths) {
+		fmt.printf("  Param %d:\n", i)
+		fmt.printf("    Type (OID): %d\n", cast(PG_OID)oids[i])
+		fmt.printf("    Length: %d\n", pd.lengths[i])
+		fmt.printf("    Format: %v\n", pd.formats[i])
+		fmt.printf("    Value (hex): %x\n", pd.values[i:offset + int(pd.lengths[i])])
+		offset+=int(pd.lengths[i])
+	}
 
 	result := pq.exec_prepared(
 		stmt.cnx.cnx,
@@ -702,7 +719,7 @@ exec_prepared :: proc(
 
 	return result_into_rows(stmt.cnx, result)
 }
-
+@(private)
 result_into_rows::proc(cnx:^Connection, result:pq.Result) ->(rows:Rows, err:Error){
 	row_count := int(pq.n_tuples(result))
 
@@ -729,7 +746,7 @@ result_into_rows::proc(cnx:^Connection, result:pq.Result) ->(rows:Rows, err:Erro
 	return rows, nil
 }
 
-
+@(private)
 make_param_data :: proc(stmt:^Prepared_Statement) -> Param_Data {
 	return Param_Data {
 		values  = make([dynamic]byte),
@@ -737,13 +754,14 @@ make_param_data :: proc(stmt:^Prepared_Statement) -> Param_Data {
 		formats = make([]pq.Format, len(stmt.arg_types)),
 	}
 }
+@(private)
 delete_param_data::proc(pd:^Param_Data) {
 	delete(pd.values)
 	delete(pd.lengths)
 	delete(pd.formats)
 }
 
-
+@(private)
 fetch_column_metadata :: proc(rows: ^Rows) {
 	column_count := int(pq.n_fields(rows.result))
 	rows.columns = make([]Column_Metadata, column_count)
@@ -811,11 +829,10 @@ scan :: proc(
 	}
 	return
 }
-// unimplemented("needs some more thought, cannot pass a maybe, i think..?")
 
 // Utilizes RTTI to automatically match types by name; use `pg:` tags to otherwise match the names
 scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T {
-	cols := get_pg_columns(T) // get `pg:` tagged columns
+	cols := get_pg_columns(T) // get `pg:` tagged columns, or use struct field names
 	defer delete(cols)
 
 	val := T{}
@@ -875,14 +892,13 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 								tag_ptr := mem.ptr_offset(struct_ptr, u.tag_offset)
 								tag := cast(^int)(tag_ptr)
 
-								// Match the variant type
 								#partial switch variant in base.variant {
 								case runtime.Type_Info_Integer:
 									value, err := scan(rows, int, i)
 									if err == nil {
 										ip := cast(^int)(field_ptr)
 										ip^ = value.(int)
-										tag^ = idx // Set the tag to indicate the union variant
+										tag^ = idx
 									}
 								case runtime.Type_Info_String:
 									value, err := scan(rows, string, i)
@@ -890,9 +906,8 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 										str := value.(string)
 										sp := cast(^string)(field_ptr)
 										sp^ = strings.clone(str)
-										tag^ = idx // Set the tag to indicate the union variant
+										tag^ = idx
 									}
-								// Handle other types as needed
 								}
 							}
 						}
@@ -909,26 +924,23 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 	return val
 }
 
-
-import rf "core:reflect"
-
 PG_Col :: struct {
-	name:  string, // Field name in struct or custom DB column name
+	name:  string, // Field name in struct or custom DB column name specified by tag `pg:the_name`
 	index: int, // Index of the field in the struct
 	field: rf.Struct_Field,
 }
+// Extract either the tag `pg:the_name`, or the struct field's name
+@(private)
 get_pg_columns :: proc(T: typeid) -> []PG_Col {
 	sfi := rf.struct_field_tags(T)
-	pg_cols := make([]PG_Col, len(sfi)) // Preallocate an array for PG_Col
+	pg_cols := make([]PG_Col, len(sfi))
 
-	// Iterate over the fields
 	for tag, i in sfi {
 		field := rf.struct_field_at(T, i)
 
 		tag_str := string(tag)
 		pg_i := strings.index(tag_str, "pg:")
 		if pg_i != -1 {
-			// Extract the pg tag value
 			s_at_pg := tag_str[pg_i + 4:] // Skip "pg:\""
 			q_i := strings.index(s_at_pg, "\"")
 			if q_i != -1 {
@@ -948,11 +960,10 @@ get_pg_columns :: proc(T: typeid) -> []PG_Col {
 			}
 		}
 	}
-
 	return pg_cols
 }
 
-// Reads text_mode values from Postgres
+// Reads .Text mode returned values
 //
 // Allocates [] types incl strings
 @(private)
@@ -989,13 +1000,12 @@ parse_text :: proc(str: string, $T: typeid, allocator:=context.allocator) -> (va
 		val = strings.clone(str,allocator)
 		return val, .None
 	}
-
 	fmt.println("..?")
 	return val, .UnknownType
 
 }
 
-
+// Search Query-String for the highest value of $i
 count_args :: proc(query: string) -> int {
 	n_args := 0
 	i := 0
@@ -1010,7 +1020,6 @@ count_args :: proc(query: string) -> int {
 				arg_num = arg_num * 10 + int(query[j] - '0')
 				j += 1
 			}
-
 			if arg_num > n_args {
 				n_args = arg_num
 			}

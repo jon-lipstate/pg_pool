@@ -1,4 +1,4 @@
 # pg-pool
 
-
-sudo apt-get install libpq-dev
+Required Library for libpq:
+`sudo apt install libpq-dev`

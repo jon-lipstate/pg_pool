@@ -5,7 +5,7 @@ import "core:fmt"
 import "core:reflect"
 
 buf_writer :: #type proc(buf:^[dynamic]byte, arg:any, format: pq.Format) -> (size:i32)
-
+col_reader :: #type proc()-> any
 Type_Decl::union{
 	typeid,
 	Postgres_Type,
@@ -14,11 +14,12 @@ Type_Decl::union{
 
 Postgres_Type :: struct {
 	oid:pq.OID,
-	writer: buf_writer, // Optional
 	format:pq.Format,
+	writer: buf_writer, // Optional
+	reader: col_reader,
 }
-
-PG_OID::enum i32{
+// TODO: use constants or enum..?
+PG_OID :: enum i32 {
 	Unknown = 0,
 	Int2 = 21,
 	Int4 = 23,
@@ -27,8 +28,7 @@ PG_OID::enum i32{
 	Float8 = 701,
 }
 pg_type::#force_inline proc(val:PG_OID)-> pq.OID { return pq.OID(val) }
-
-// TODO: make into enum with inline-proc of oid::proc(val:OID) -> pq.OID
+//
 OID_UNKNOWN::0 
 // ints
 OID_INT2 :: 21
@@ -42,14 +42,14 @@ OID_BOOL :: 16
 // strings
 OID_TEXT :: 25
 OID_VARCHAR :: 1043
-OID_BPCHAR ::1042
+OID_BPCHAR :: 1042
 // dates
 OID_DATE :: 1082 // 4bytes, days since 2000-01-01
-OID_TIMESTAMP :: 1114 // 8bytes, us since epoch
-OID_TIMESTAMPTZ :: 1184 // 8bytes, us since epoch, UTC
-OID_TIME :: 1083 // 8bytes, time without tz, var len, us since midnight
-OID_TIMETZ::1266 // 16bytes, as above, utc
-OID_INTERVAL::1186 // 16bytes, mon,day, 'us'
+OID_TIMESTAMP :: 1114 // 8bytes, 'µs' since epoch
+OID_TIMESTAMPTZ :: 1184 // 8bytes, 'µs' since epoch, UTC
+OID_TIME :: 1083 // 8bytes, time without tz, var len, 'µs' since midnight
+OID_TIMETZ :: 1266 // 16bytes, as above, utc
+OID_INTERVAL :: 1186 // 16bytes, mon,day, 'µs'
 // binary/json
 OID_BYTEA::17
 OID_JSON::114
@@ -64,17 +64,3 @@ OID_ARR_FLOAT8::1022
 // 
 OID_TSVECTOR :: 3614
 OID_TSQUERY::3615
-
-// DB_Type :: struct {
-// 	oid:      pq.OID,
-// 	name:     string,
-// 	n_bytes:  int,
-// 	category: TypeCategory,
-// 	type:     reflect.Type_Kind,
-// }
-
-DB_Type :: struct {
-	oid:     pq.OID,
-	size:    int,
-	write_data:   proc(arg: any, pd: ^Param_Data, idx: int) -> Error,
-}

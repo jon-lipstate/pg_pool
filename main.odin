@@ -31,6 +31,7 @@ User :: struct {
 	last_name:  string,
 }
 
+// Custom Type Bindings - allows writing into the query buffer:
 Int_PG_Type := pool.Postgres_Type {
 	oid=pool.OID_INT4,
 	format = .Binary,
@@ -46,27 +47,25 @@ _main :: proc() {
 	url := os.get_env("DATABASE_URL"); defer delete(url)
 
 	pool.init(url, min_connections=1); defer pool.destroy_pool()
-	// pool.health_check()
 	
-	cnx, _:=pool.acquire()
-	defer pool.release(cnx)
-	stmt, p_err:= pool.prepare(cnx,"get_user", "SELECT user_id, first_name, last_name from users WHERE user_id = $1;", {typeid_of(i32)}) // alt: {pg_type(.Int4)}
-	fmt.println("p_err", p_err)
-	rows, err:=pool.exec_prepared(&stmt, 3)	
-	fmt.println("err",err)
+	// Example of using a Prepared Statement - more Low-Level api, but provides benefits of pre-planned queries
+	// cnx, _:=pool.acquire()
+	// defer pool.release(cnx)
+	// stmt, p_err:= pool.prepare(cnx,"get_user", "SELECT user_id, first_name, last_name from users WHERE user_id = $1;", {typeid_of(i32)}) // alt: {pg_type(.Int4)}
+	// rows, err:=pool.exec_prepared(&stmt, 3)	
 
-	// SELECT $1::int
-
-	// rows, err:= pool.query("SELECT user_id, first_name, last_name from users WHERE user_id = $1;", types={Int_PG_Type}, args={3} )
-	// defer pool.release_query(&rows)
+	// Example using Query:
+	rows, err:= pool.query("SELECT user_id, first_name, last_name from users WHERE user_id = $1;", types={Int_PG_Type}, args={3} )
+	defer pool.release_query(&rows)
 
 	if err == nil {
 		for pool.next_row(&rows) {
-			user := pool.scan_into(&rows, User)
+			user := pool.scan_into(&rows, User) // Use RTTI to assign values into a struct
 			fmt.println("USER", user)
 			delete(user.first_name)
 			delete(user.last_name)
 			break
+			
 			// uid, u_err := pool.scan(&rows, int, 0)
 			// first, f_err := pool.scan(&rows, string, 1)
 			// last, l_err := pool.scan(&rows, string, 2)
@@ -76,14 +75,6 @@ _main :: proc() {
 			// delete(last.(string))
 		}
 	} else {
-		fmt.println("POOL ERROR", err)
+		fmt.println("ERROR", err)
 	}
-
-
-	// cnx := pool.acquire();defer pool.release(cnx)
-	// pok := pool.prepare(cnx, "abc", "SELECT first_name from users where user_id=$1;")
-	// dok := pool.describe_prepared_statement(cnx, "abc")
-	// fmt.println(pok, dok)
-
-	// pool.load_type_cache()
 }
