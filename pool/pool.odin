@@ -12,6 +12,7 @@ import "core:sync"
 import "core:time"
 import dt "core:time/datetime"
 import rf "core:reflect"
+import "core:encoding/json"
 
 // Global / Singleton
 POOL: Connection_Pool
@@ -444,8 +445,8 @@ get_oid :: #force_inline proc(tid: typeid) -> (oid: pq.OID) {
 			return OID_BYTEA
 		case time.Time:
 			return OID_TIMESTAMPTZ // OR  OID_TIMESTAMP
-		case time.Date:
-			return OID_DATE
+		// case time.Date:
+		// 	return OID_DATE
 		case json.Value:
 			return OID_JSONB
 		// case []bool:

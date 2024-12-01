@@ -55,7 +55,8 @@ _main :: proc() {
 	// rows, err:=pool.exec_prepared(&stmt, 3)	
 
 	// Example using Query:
-	rows, err:= pool.query("SELECT user_id, first_name, last_name from users WHERE user_id = $1;", types={Int_PG_Type}, args={3} )
+	// rows, err:= pool.query("SELECT user_id, first_name, last_name from users WHERE user_id = $1;", types={Int_PG_Type}, args={3} ) // types is optional for custom writers
+	rows, err:= pool.query("SELECT user_id, first_name, last_name from users WHERE user_id = $1;", args={3} )
 	defer pool.release_query(&rows)
 
 	if err == nil {
