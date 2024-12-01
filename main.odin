@@ -5,6 +5,8 @@ import "core:mem"
 import "core:os"
 import "env"
 import "pool"
+import pq "./vendor/odin-postgresql"
+
 
 main :: proc() {
 	tracker: mem.Tracking_Allocator
@@ -28,28 +30,42 @@ User :: struct {
 	first_name: string,
 	last_name:  string,
 }
+
+Int_PG_Type := pool.Postgres_Type {
+	oid=pool.OID_INT4,
+	format = .Binary,
+	writer=proc(buf:^[dynamic]byte, arg:any, format: pq.Format) -> (size:i32) {
+		p_bytes:=pool.to_bytes(i32be(pool.extract_int(arg)))
+		append(buf, ..p_bytes)
+		return 4
+	}
+}
+
 _main :: proc() {
 	if !env.set() {panic("Failed to read .env file, aborting.")}
 	url := os.get_env("DATABASE_URL"); defer delete(url)
 
 	pool.init(url, min_connections=1); defer pool.destroy_pool()
-	pool.health_check()
+	// pool.health_check()
+	
+	cnx, _:=pool.acquire()
+	defer pool.release(cnx)
+	stmt, p_err:= pool.prepare(cnx,"get_user", "SELECT user_id, first_name, last_name from users WHERE user_id = $1;", {typeid_of(i32)}) // alt: {pg_type(.Int4)}
+	fmt.println("p_err", p_err)
+	rows, err:=pool.exec_prepared(&stmt, 3)	
+	fmt.println("err",err)
 
-// 	cnx, _:=pool.acquire()
-// 	defer pool.release(cnx)
-// 	ps_err:= pool.prepare_statement(cnx,"uid", "SELECT user_id, first_name, last_name from users WHERE user_id = $1;")
-// fmt.println("ps-err",ps_err)
-// 	result,ex_err:=pool.exec_prepared_statement(cnx,"uid", 1)
-// fmt.println("ex-err",ex_err)
-// SELECT $1::int
-	rows, err:= pool.query2("SELECT user_id, first_name, last_name from users WHERE user_id = $1;",args={3})
-	// rows, err:= pool.query2("SELECT 1;")
-	defer pool.release_query(&rows)
+	// SELECT $1::int
+
+	// rows, err:= pool.query("SELECT user_id, first_name, last_name from users WHERE user_id = $1;", types={Int_PG_Type}, args={3} )
+	// defer pool.release_query(&rows)
 
 	if err == nil {
 		for pool.next_row(&rows) {
 			user := pool.scan_into(&rows, User)
 			fmt.println("USER", user)
+			delete(user.first_name)
+			delete(user.last_name)
 			break
 			// uid, u_err := pool.scan(&rows, int, 0)
 			// first, f_err := pool.scan(&rows, string, 1)

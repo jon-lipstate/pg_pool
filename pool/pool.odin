@@ -12,6 +12,8 @@ import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:time"
+import dt "core:time/datetime"
+
 
 // Global / Singleton
 POOL: Connection_Pool
@@ -37,11 +39,12 @@ Connection_Pool :: struct {
 	max_size:           int,
 	max_life_time:      time.Duration,
 	max_idle_time:      time.Duration,
-	text_mode:          bool, // only text-mode atm!
+	//
+	int_policy: 		Int_Policy, // maybe use bitset for uints, allow int etc??
+	//
 	base_allocator:     mem.Allocator, // what was passed to init
 	cnx_backing:        []byte, // allocated by base_allocator
 	cnx_allocator:      mem.Buddy_Allocator,
-	int_policy: 		Int_Policy, // bitset for uints, allow int etc??
 }
 
 Int_Policy::enum { 
@@ -55,36 +58,7 @@ Connection :: struct {
 	last_active: time.Time,
 	arena:       mem.Arena,
 	allocator:   mem.Allocator,
-	statements:  map[string]Prepared_Statement, // delete me
 }
-
-// Basic_Types :: union {
-// 	^bool,
-// 	// u8,
-// 	// u16,
-// 	// u32,
-// 	// u64,
-// 	^uint,
-// 	// i8,
-// 	// i16,
-// 	// i32,
-// 	// i64,
-// 	^int,
-// 	^f32,
-// 	^f64,
-// 	^rune,
-// 	^string,
-// 	^time.Time,
-// 	^time.DateTime,
-// 	^time.Date,
-// 	^[]bool,
-// 	^[]byte, // bytea
-// 	^[]uint,
-// 	^[]int,
-// 	^[]f32,
-// 	^[]f64,
-// 	^[]string,
-// }
 
 // Postgres integers: 
 //
@@ -145,7 +119,6 @@ destroy_pool :: proc() -> Error {
 	delete(POOL.idle_connections)
 	delete(POOL.cnx_backing)
 	return nil // FIXME: any checks??
-
 }
 
 // postgres://user:password@localhost:5432/mydb?sslmode=disable&application_name=myapp
@@ -249,6 +222,7 @@ acquire :: proc(allocation_size: uint = 16 * mem.Kilobyte) -> (^Connection, Erro
 	err := set_connection_arena(cnx, allocation_size)
 	return cnx, err
 }
+
 release :: proc(cnx: ^Connection) -> Error {
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
@@ -379,76 +353,6 @@ rebalance :: proc() -> (ok: bool) {
 	return true
 }
 
-Exec_Result :: struct {
-	result: pq.Result,
-	cnx:    ^Connection,
-}
-
-exec :: proc(
-	sql: string,
-	arena_size: uint = 64 * mem.Kilobyte,
-	arguments: ..any,
-) -> (
-	result: Exec_Result,
-	err: Error,
-) {
-	cnx, error := acquire(arena_size)
-	context.allocator = cnx.allocator //arena
-
-	if error != nil {
-		return {}, .FailedToAcquireConnection
-	}
-	// Prepare the query with arguments (e.g., using positional placeholders $1, $2, etc.)
-	formatted_sql := format_sql_with_args(sql, arguments)
-	if formatted_sql == "" {
-		return {}, QueryError.FormattingError
-	}
-	res := pq.exec(cnx.cnx, strings.clone_to_cstring(formatted_sql))
-	if res == nil {
-		err := db_error_from_msg(cnx)
-		return {}, err
-	}
-	return {res, cnx}, nil
-}
-
-prepare :: proc(cnx: ^Connection, name: string, sql: string) -> Error {
-	context.allocator = cnx.allocator //arena
-
-	c_stmt_name := strings.clone_to_cstring(name)
-	c_sql := strings.clone_to_cstring(sql)
-
-	res := pq.prepare(cnx.cnx, c_stmt_name, c_sql, 2, nil)
-	if pq.result_status(res) != pq.Exec_Status.Command_OK {
-		err := db_error_from_msg(cnx)
-		pq.clear(res)
-		return err
-	}
-	pq.clear(res)
-	return nil
-}
-
-// exec_prepared :: proc(cnx: ^Connection, name: string, args: ..any) -> (res: pq.Result, ok: bool) {
-// 	c_stmt_name := strings.clone_to_cstring(name, context.temp_allocator)
-// 	defer free_all(context.temp_allocator)
-
-// 	param_values := []^byte{}
-// 	for param in params {
-// 		c_param := strings.clone_to_cstring(param, context.temp_allocator)
-// 		append(&param_values, c_param)
-// 	}
-
-// 	res := pq.exec_prepared(cnx.cnx, c_stmt_name, len(param_values), param_values, nil, nil, .Text)
-
-// 	if pq.result_status(res) != pq.Exec_Status.Tuples_OK {
-// 		fmt.println("Execution failed:", pq.error_message(cnx.cnx))
-// 		pq.clear(res)
-// 		return nil, false
-// 	}
-
-// 	return res, true
-// }
-
-
 Rows :: struct {
 	result:      pq.Result,
 	cnx:         ^Connection,
@@ -462,7 +366,8 @@ Column_Metadata :: struct {
 	text_mode: bool,
 }
 
-query2 :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) -> (Rows, Error) {
+
+query :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, types: []Postgres_Type=nil, args: ..any) -> (Rows, Error) {
 	cnx, err := acquire(arena_size)
 	if err != nil {
 		fmt.eprintln("query error:", err)
@@ -475,14 +380,15 @@ query2 :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) -
 	ep:= make_exec_params(n_args)
 	defer delete_exec_params(&ep)
 
-	for arg,i in args{
-		set_exec_param(&ep,i,arg)
+	for arg, i in args {
+		type:= types!=nil ? &types[i] : nil
+		set_exec_param(&ep, i, arg, type)
 	}
 	
 	p_types:= n_args>0 ? &ep.types[0] : nil
 	p_lens:= n_args>0 ? &ep.lengths[0]:nil
 	p_formats:= n_args>0 ?&ep.formats[0]:nil
-	value_ptrs := get_value_ptrs(&ep)
+	value_ptrs := get_value_ptrs(ep.values, ep.lengths)
 	p_values := n_args>0 ? transmute([^][^]byte)&value_ptrs[0] : nil
 	defer if value_ptrs!=nil {delete(value_ptrs)}
 
@@ -491,11 +397,10 @@ query2 :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) -
 	// 	fmt.printf("  Param %d:\n", i)
 	// 	fmt.printf("    Type (OID): %d\n", ep.types[i])
 	// 	fmt.printf("    Length: %d\n", ep.lengths[i])
-	// 	fmt.printf("    Format: %s\n", ep.formats[i] == .Binary ? "Binary" : "Text")
+	// 	fmt.printf("    Format: %v\n", ep.formats[i])
 	// 	fmt.printf("    Value (hex): %x\n", ep.values[i:i+ int(ep.lengths[i])])
 	// }
-
-
+fmt.println("FIXME: SCAN IS TEXT, CALL QUERY IS BINARY!")
 	result := pq.exec_params(cnx.cnx, c_sql, i32(n_args), p_types, p_values, p_lens, p_formats, .Text)
 
 	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
@@ -503,36 +408,12 @@ query2 :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) -
 		release(cnx)
 		return {}, err
 	}
-
-	row_count := int(pq.n_tuples(result))
-
-	columns := make([]Column_Metadata, int(pq.n_fields(result)))
-
-	for i in 0 ..< len(columns) {
-		column_name := cast(string)(pq.f_name(result, i32(i)))
-		column_oid := pq.f_type(result, i32(i))
-		text_mode := pq.f_format(result, i32(i)) == .Text
-
-		columns[i] = Column_Metadata {
-			name      = column_name,
-			oid       = column_oid,
-			text_mode = text_mode,
-		}
-	}
-	rows:=Rows {
-		result = result,
-		cnx = cnx,
-		current_row = -1,
-		row_count = row_count,
-		columns = columns,
-	}
-	return rows, nil
-
+	return result_into_rows(cnx, result)
 }
 
 Exec_Params :: struct {
 	types:	[]pq.OID,
-	values:  [dynamic]byte,
+	values:  [dynamic]byte, // this is backing buffer; exec_params uses [] of ptrs
 	lengths: []i32,
 	formats: []pq.Format,
 }
@@ -551,26 +432,138 @@ delete_exec_params::proc(ep:^Exec_Params){
 	delete(ep.lengths)
 	delete(ep.formats)
 }
-get_value_ptrs :: proc(ep: ^Exec_Params, allocator:=context.allocator) -> [][^]byte {
-    if ep.values==nil || len(ep.values) == 0 {
+
+
+
+get_oid :: #force_inline proc(tid:typeid) -> (oid:pq.OID) {
+switch tid {
+	case bool:
+		return OID_BOOL
+	case i16:
+		return OID_INT2
+	case i32:
+		return OID_INT4
+	case int:
+		return OID_INT4
+	case i64:
+		return OID_INT8
+	case f32:
+		return OID_FLOAT4
+	case f64:
+		return OID_FLOAT8
+	// case time.Duration:
+	// case time.Time:
+
+	// 	return 
+}
+	fmt.println("Err - Unknown OID for typeid:", tid) // FIXME: do something better here
+	return OID_UNKNOWN
+}
+
+extract_bool :: #force_inline proc(arg:any)-> bool {
+	switch a in arg {
+		case bool: return bool(a)
+		case b16: return bool(a)
+		case b32: return bool(a)
+		case b64: return bool(a)			
+		case:
+			panic("Invalid Type Cast - bool") // Fixme: turn to error?
+	}
+}
+extract_int :: #force_inline proc(arg:any)-> int {
+	switch a in arg {
+		case i8: return int(a)
+		case i16: return int(a)
+		case i32: return int(a)
+		case i64: return int(a)
+		case int: return int(a)
+		// case u8, u16, u32, u64, uint:
+		// 	return int(a)
+		case:
+			panic("Invalid Type Cast - int") // Fixme: turn to error?
+	}
+}
+
+copy_into_buf :: proc(buf:^[dynamic]byte, arg:any, oid:pq.OID, tid: ^Postgres_Type = nil) -> (size:i32, err:Error) {
+	switch oid {
+		case OID_BOOL:
+			append(buf, transmute(byte)extract_bool(arg))
+			size=1
+		case OID_INT2:			
+			p_bytes:=to_bytes(i16be(extract_int(arg)))
+			append(buf, ..p_bytes)
+			size=2	
+		case OID_INT4:			
+			p_bytes:=to_bytes(i32be(extract_int(arg)))
+			append(buf, ..p_bytes)
+			size=4	
+		case OID_INT8:			
+			p_bytes:=to_bytes(i64be(extract_int(arg)))
+			append(buf, ..p_bytes)
+			size=8	
+		case OID_FLOAT4:
+			p_bytes:=to_bytes(f32be(arg.(f32)))
+			append(buf, ..p_bytes)
+			size=4	
+		case OID_FLOAT8:
+			p_bytes:=to_bytes(f32be(arg.(f64)))
+			append(buf, ..p_bytes)
+			size=8
+		
+		// case []byte:
+		// 	ep.types[i] = OID_BYTEA 
+		// 	append(buf, ..p)
+		// 	ep.lengths[i]=i32(len(p))
+		// case string:
+		// 	ep.types[i] = OID_TEXT 
+		// 	p_bytes:[]byte= raw_data(p)[:len(p)]
+		// 	append(buf, ..p_bytes)
+		// 	ep.lengths[i]=i32(len(p))
+		// 	ep.formats[i] = .Text
+		case:
+			// ep.formats[i] = .Text
+			err = .UnknownType
+	}
+	return
+}
+
+// TODO: optional pass OID to do JSONB or other odd formats?
+set_exec_param :: proc(ep: ^Exec_Params, i: int, param: any, type: ^Postgres_Type = nil) ->(err:Error) {
+	oid:pq.OID
+	format: pq.Format = .Binary
+	if type!=nil{
+		oid = type.oid
+		format = type.format
+	} else {
+		oid = get_oid(param.id)
+	}
+	ep.formats[i] = format
+	ep.types[i] = oid
+	ep.lengths[i], err = copy_into_buf(&ep.values, param, oid, type)
+	if err !=nil { return }
+	
+	// fmt.println("EP [types], [values], [lens], [formats]",ep.types,ep.values,ep.lengths,ep.formats)
+	// for b in ep.values{fmt.println(b)}
+	return
+}
+get_value_ptrs :: proc(backing: [dynamic]byte, lens:[]i32, allocator:=context.allocator) -> [][^]byte {
+    if backing==nil || len(lens) == 0 {
         return nil // No parameters
     }
 
-    buf := make([dynamic][^]byte, len(ep.values),allocator)
+    buf := make([dynamic][^]byte, len(lens),allocator)
 
     offset := 0
-    for length, i in ep.lengths {
-        buf[i] = &ep.values[offset]
+    for length, i in lens {
+        buf[i] = &backing[offset]
         offset += int(length)
     }
 
     return buf[:]
 }
 
-
-
 to_bytes :: #force_inline proc(v:$T) -> []byte {
-	// NOTE: Must be #force_inline or it needs to allocate
+	// NOTE: Must be #force_inline, or it needs to allocate
 	v:=v
 	p:=&v
 	bytes:=(transmute([^]byte)p)[:size_of(T)]
@@ -578,86 +571,141 @@ to_bytes :: #force_inline proc(v:$T) -> []byte {
 	return bytes
 }
 
-set_exec_param::proc(ep:^Exec_Params, i:int, param:any) {
-	ep.formats[i] = .Binary
-	
-	switch p in param {
-		case bool:
-			ep.types[i] = OID_BOOL
-			append(&ep.values, ..to_bytes(p))
-			ep.lengths[i]=1
-		case i8,u8,u16,u32,u64,uint:
-			// ERROR - Type Not Supported
-		case i16:
-			ep.types[i] = OID_INT2 
-			append(&ep.values, ..to_bytes(i16be(p)))
-			ep.lengths[i]=2
-		case i32:
-			ep.types[i] = OID_INT4 
-			append(&ep.values, ..to_bytes(i32be(p)))
-			ep.lengths[i]=4
-		case i64:
-			ep.types[i] = OID_BIG_INT
-			append(&ep.values, ..to_bytes(i64be(p)))
-			ep.lengths[i]=8
-		case int:			
-			if POOL.int_policy == .Int_as_Int4 {
-				ep.types[i] = OID_INT4 
-				p_bytes:=to_bytes(i32be(p))
-				append(&ep.values, ..p_bytes)
-				ep.lengths[i]=4
-			} else {
-				ep.types[i] = OID_BIG_INT
-				p_bytes:=to_bytes(i64be(p))
-				append(&ep.values, ..p_bytes)
-				ep.lengths[i]=8
-			}		
-		case f32:
-			ep.types[i] = OID_FLOAT4 
-			append(&ep.values, ..to_bytes(f32be(p)))
-			ep.lengths[i]=4	
-		case f64:
-			ep.types[i] = OID_FLOAT8 
-			append(&ep.values, ..to_bytes(f64be(p)))
-			ep.lengths[i]=8
-		case []byte:
-			ep.types[i] = OID_BYTEA 
-			append(&ep.values, ..p)
-			ep.lengths[i]=i32(len(p))
-		case string:
-			ep.types[i] = OID_TEXT 
-			p_bytes:[]byte= raw_data(p)[:len(p)]
-			append(&ep.values, ..p_bytes)
-			ep.lengths[i]=i32(len(p))
-			ep.formats[i] = .Text
-		case:
-			ep.formats[i] = .Text
-
-	}
-	// fmt.println("EP [types], [values], [lens], [formats]",ep.types,ep.values,ep.lengths,ep.formats)
-	// for b in ep.values{fmt.println(b)}
+Prepared_Statement :: struct {
+	cnx:		 ^Connection,
+	name:        cstring,
+	sql:         string,
+	arg_types:	 []Type_Decl,
+	result_types:   []pq.OID,
+}
+Param_Data :: struct {
+	values:  [dynamic]byte,
+	lengths: []i32,
+	formats: []pq.Format,
 }
 
+prepare :: proc(
+	cnx: ^Connection,
+	name: string,
+	sql: string,
+	types: []Type_Decl,
+) -> (
+	stmt: Prepared_Statement,
+	err: Error,
+) {
+	context.allocator = cnx.allocator
+	
+	stmt.cnx = cnx
+	stmt.name = strings.clone_to_cstring(name)
 
-query :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) -> (Rows, Error) {
-	cnx, err := acquire(arena_size)
-	if err != nil {
-		fmt.eprintln("query error:", err)
-		return {}, .FailedToAcquireConnection
+	c_sql := strings.clone_to_cstring(sql)
+	defer {delete(c_sql)}
+
+	n_args:=count_args(sql)
+	stmt.arg_types = make([]Type_Decl, n_args)
+	for type, i in types {
+		stmt.arg_types[i] = types[i]
 	}
-	context.allocator = cnx.allocator // Use the connection's arena
+	
+	oids:= extract_oids(stmt.arg_types); defer delete(oids)
+	p_types := oids != nil ? &oids[0] : nil
 
-	formatted_sql := format_sql_with_args(sql, args)
-	c_sql := strings.clone_to_cstring(formatted_sql)
-	// defer free_all(context.temp_allocator) // <-- cant do this because we need the columns to persist till the end of the query
-	result := pq.exec(cnx.cnx, c_sql)
-	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
-		err := db_error_from_msg(cnx)
-		release(cnx)
-		return {}, err
+	result := pq.prepare(cnx.cnx, stmt.name, c_sql, i32(n_args), p_types)
+	if result == nil {
+		err = db_error_from_msg(cnx)
+		return  
 	}
 
+	status := pq.result_status(result)
+	if status != pq.Exec_Status.Command_OK {
+		err_msg := pq.error_message(cnx.cnx)
+		err = db_error_from_msg(cnx)
+		return  
+	}
+
+	pq.clear(result)
+
+	return 
+}
+
+extract_oids :: proc(types: []Type_Decl)-> []pq.OID {
+	if len(types)==0 {return nil}
+
+	oids := make([]pq.OID, len(types))
+	for type, i in types {
+		switch t in type{
+			case typeid:
+				oids[i] = get_oid(t)
+			case Postgres_Type:
+				oids[i] = t.oid
+			case pq.OID:
+				oids[i] = t
+		}
+	}
+	return oids
+}
+
+exec_prepared :: proc(
+	stmt: ^Prepared_Statement,
+	args: ..any,
+	allocator := context.allocator,
+) -> (
+	rows: Rows,
+	err: Error,
+) {
+	if stmt.cnx == nil {
+		err = db_error(.ConnectionError, "Prepared Statement's Connection is nil")
+		return
+	}
+	n_args:= len(args)
+
+	if n_args != len(stmt.arg_types) {
+		return {}, db_error(.InvalidArgument, fmt.tprintf("Expected '%d' arguments, got '%d' args", len(stmt.arg_types), n_args)) 		
+	}
+
+	pd:= make_param_data(stmt); defer delete_param_data(&pd)
+	oids:= extract_oids(stmt.arg_types); defer delete(oids) // cache this..?
+	
+	for arg, i in args {
+		writing_type, _ := stmt.arg_types[i].(Postgres_Type)
+		size, err := copy_into_buf(&pd.values, arg, oids[i], &writing_type)
+		if err != nil {return {}, err}
+	}
+
+	p_lens:= n_args>0 ? &pd.lengths[0]:nil
+	p_formats:= n_args>0 ?&pd.formats[0]:nil
+	value_ptrs := get_value_ptrs(pd.values, pd.lengths)
+	p_values := n_args>0 ? transmute([^][^]byte)&value_ptrs[0] : nil
+	defer if value_ptrs!=nil {delete(value_ptrs)}
+
+	result := pq.exec_prepared(
+		stmt.cnx.cnx,
+		stmt.name,
+		i32(n_args),
+		p_values,
+		p_lens,
+		p_formats,
+		pq.Format.Text,
+	)
+
+	if result == nil {
+		err_msg := pq.error_message(stmt.cnx.cnx)
+		return {}, db_error(.ExecutionError,
+			err_msg != nil ? strings.clone(string(err_msg), allocator) : "Unknown error",) 
+	}
+
+	status := pq.result_status(result)
+	if status != pq.Exec_Status.Tuples_OK && status != pq.Exec_Status.Command_OK {
+		err_msg := pq.result_error_message(result)
+		return {}, db_error(.ExecutionError, err_msg != nil ? strings.clone(string(err_msg), allocator) : "Unknown error",) 
+	}
+
+	return result_into_rows(stmt.cnx, result)
+}
+
+result_into_rows::proc(cnx:^Connection, result:pq.Result) ->(rows:Rows, err:Error){
 	row_count := int(pq.n_tuples(result))
+
 	columns := make([]Column_Metadata, int(pq.n_fields(result)))
 
 	for i in 0 ..< len(columns) {
@@ -671,302 +719,28 @@ query :: proc(sql: string, arena_size: uint = 64 * mem.Kilobyte, args: ..any) ->
 			text_mode = text_mode,
 		}
 	}
-
-	return Rows {
-			result = result,
-			cnx = cnx,
-			current_row = -1,
-			row_count = row_count,
-			columns = columns,
-		},
-		nil
-}
-
-Prepared_Statement :: struct {
-	name:        string,
-	sql:         string,
-	param_types: []pq.OID, // args
-	col_types:   []pq.OID, // results
+	rows = Rows {
+		result = result,
+		cnx = cnx,
+		current_row = -1,
+		row_count = row_count,
+		columns = columns,
+	}
+	return rows, nil
 }
 
 
-prepare_statement :: proc(
-	cnx: ^Connection,
-	name: string,
-	sql: string,
-	allocator := context.allocator,
-) -> (
-	err: Error,
-) {
-	context.allocator = allocator
-	if name in cnx.statements {
-		fmt.println("OVER_WRITING STMT")
-		return  nil // Already prepared 
-	}
-
-	c_name := strings.clone_to_cstring(name)
-	c_sql := strings.clone_to_cstring(sql)
-	defer {
-		delete(c_name)
-		delete(c_sql)
-	}
-
-	result := pq.prepare(cnx.cnx, c_name, c_sql, 0, nil)
-	if result == nil {
-		return  db_error_from_msg(cnx)
-	}
-
-	status := pq.result_status(result)
-	if status != pq.Exec_Status.Command_OK {
-		err_msg := pq.error_message(cnx.cnx)
-		return  db_error_from_msg(cnx)
-	}
-
-	desc := pq.describe_prepared(cnx.cnx, c_name)
-	if desc == nil {
-		return db_error_from_msg(cnx)
-	}
-
-	param_count := pq.n_params(desc)
-	fmt.println("Prepared statement params:", param_count) 
-	pq.clear(desc)
-
-
-	param_types := make([]pq.OID, param_count)
-
-	for i in 0 ..< param_count {
-		param_types[i] = pq.param_type(result, i32(i))
-		fmt.println("PT-i", param_types[i],i)
-	}
-
-	cnx.statements[name] = Prepared_Statement {
-		name        = name,
-		sql         = sql,
-		param_types = param_types,
-		col_types   = nil, 
-	}
-
-	// Clear the result
-	pq.clear(result)
-
-	return  nil
-}
-
-
-exec_prepared_statement :: proc(
-	cnx: ^Connection,
-	name: string,
-	args: ..any,
-	allocator := context.allocator,
-) -> (
-	result: pq.Result,
-	err: Error,
-) {
-	if cnx == nil {
-		return nil, db_error(.ConnectionError, "Connection is nil")
-	}
-
-	if name not_in cnx.statements {
-		return nil, db_error(.StatementNotPrepared,fmt.tprintf("Statement '%s' is not prepared", name))
-	}
-
-	stmt := cnx.statements[name]
-	n_args:= len(args)
-
-	if n_args != len(stmt.param_types) {
-		return nil, db_error(.InvalidArgument, fmt.tprintf("Expected '%d' arguments, got '%d' args", len(stmt.param_types), n_args)) 		
-	}
-
-
-	pd, prep_err := prepare_param_data(stmt.param_types, ..args)
-	if prep_err != nil {return nil, prep_err}
-	defer delete(pd.values)
-	defer delete(pd.lengths)
-	defer delete(pd.formats)
-
-	c_name := strings.clone_to_cstring(name, allocator)
-	defer delete(c_name)
-
-
-
-	val_arr := n_args>0 ? transmute([^][^]u8)&(pd.values[:])[0] : nil
-	len_arr := n_args>0 ? &pd.lengths[0] : nil
-	format_arr := n_args>0 ? &pd.formats[0] : nil
-
-	result = pq.exec_prepared(
-		cnx.cnx,
-		c_name,
-		i32(n_args),
-		val_arr,
-		len_arr,
-		format_arr,
-		pq.Format.Binary,
-	)
-
-	if result == nil {
-		err_msg := pq.error_message(cnx.cnx)
-		return nil, db_error(.ExecutionError,
-			err_msg != nil ? strings.clone(string(err_msg), allocator) : "Unknown error",) 
-	}
-
-	status := pq.result_status(result)
-	if status != pq.Exec_Status.Tuples_OK && status != pq.Exec_Status.Command_OK {
-		err_msg := pq.result_error_message(result)
-		return nil, db_error(.ExecutionError, err_msg != nil ? strings.clone(string(err_msg), allocator) : "Unknown error",) 
-	}
-
-	return result, nil
-
-}
-Param_Data :: struct {
-	values:  [dynamic]byte,
-	lengths: []i32,
-	formats: []pq.Format,
-}
-
-oid_types := map[typeid]pq.OID{
-	
-	i32 = 23,  // int4
-	u32 = 23,  // int4
-	i64 = 20,  // bigint
-	int = 20,  // bigint
-	uint = 20,  // bigint
-}
-
-
-type_cache := map[pq.OID]DB_Type {
-	// 23 = {oid = 23, name = "int4", size = 4, proc(arg: any, pd: ^Param_Data, idx: int) -> Error {
-	// 		fmt.println("HI TO INT4")
-	// 		unimplemented()
-	// 	}, proc(arg: any, allocator := context.allocator) -> (int, Error) {
-	// 		fmt.println("HI FROM INT4")
-	// 		unimplemented()
-	// 	}},
-}
-
-
-prepare_param_data :: proc(param_types: []pq.OID, args: ..any) -> (pd: Param_Data, err: Error) {
-
-	if len(args) != len(param_types) {
-		return pd, db_error(.InvalidArgument, fmt.tprintf(
-			"Mismatched parameter count: expected '%d', got '%d'",
-			len(param_types),
-			len(args),
-		))
-	}
-
-	pd = Param_Data {
+make_param_data :: proc(stmt:^Prepared_Statement) -> Param_Data {
+	return Param_Data {
 		values  = make([dynamic]byte),
-		lengths = make([]i32, len(args)),
-		formats = make([]pq.Format, len(args)),
+		lengths = make([]i32, len(stmt.arg_types)),
+		formats = make([]pq.Format, len(stmt.arg_types)),
 	}
-
-	for arg, i in args {
-		oid := cast(pq.OID)param_types[i]
-
-		// if oid not_in type_cache {
-		// 	return pd, DB_Error {
-		// 		kind = .InvalidArgument,
-		// 		msg = fmt.tprintf(
-		// 			"OID '%d' is not a known type in the 'type_cache' for param[%d]",
-		// 			oid,
-		// 			i,
-		// 		),
-		// 	}
-		// }
-
-
-		tc := type_cache[oid]
-		fmt.println("TC", tc)
-
-		// switch tc.type {
-		// case .Integer:
-
-		// a, ok := reflect.as_i64(arg) // FIXME: prob not the fastest way to do this...
-
-		// pd.formats[i] = pq.Format.Binary
-
-		err := tc.to_pg(arg, &pd, i)
-		assert(err == nil)
-		// switch param_types[i] {
-		// case pq.OID_INT2:
-		// 	append(&pd.values, cast(i16be)a)
-		// 	pd.lengths[i] = 2
-		// case pq.OID_INT4:
-		// 	append(&pd.values, cast(i32be)a)
-		// 	pd.lengths[i] = 4
-		// case pq.OID_INT8:
-		// 	append(&pd.values, cast(i64be)a)
-		// 	pd.lengths[i] = 8
-		// case:
-		// 	unreachable()
-		// }
-
-
-		// case .Float:
-		// 	if tk != .Float {
-		// 		delete(pd.values);delete(pd.lengths);delete(pd.formats)
-		// 		return pd, DB_Error {
-		// 			kind = .InvalidArgument,
-		// 			msg = fmt.tprintf("Expected 'Float' for param[%d]", i),
-		// 		}
-		// 	}
-		// 	a, ok := reflect.as_f64(arg) // FIXME: prob not the fastest way to do this...
-
-		// 	pd.formats[i] = pq.Format.Binary
-
-		// 	switch param_types[i] {
-		// 	case pq.OID_FLOAT4:
-		// 		append(&pd.values, cast(f32be)a)
-		// 		pd.lengths[i] = 4
-		// 	case pq.OID_FLOAT8:
-		// 		append(&pd.values, cast(f64be)a)
-		// 		pd.lengths[i] = 8
-		// 	case:
-		// 		unreachable()
-		// 	}
-
-		// case .String:
-		// 	// FIXME: prob want to be more relaxed here..? []byte etc?
-		// 	if tk != .String {
-		// 		delete(pd.values);delete(pd.lengths);delete(pd.formats)
-		// 		return pd, DB_Error {
-		// 			kind = .InvalidArgument,
-		// 			msg = fmt.tprintf("Expected 'String' for param[%d]", i),
-		// 		}
-		// 	}
-		// 	str, ok := arg.(string);if ok {
-		// 		append(&pd.values, ..str)
-		// 		pd.lengths[i] = i32(len(str))
-		// 		pd.formats[i] = pq.Format.Text
-		// 	}
-		// 	assert(ok, "unreachable")
-
-
-		// case .Boolean:
-		// 	if tk != .Boolean {
-		// 		delete(pd.values);delete(pd.lengths);delete(pd.formats)
-		// 		return _, DB_Error {
-		// 			kind = .InvalidArgument,
-		// 			msg = fmt.tprintf("Expected 'Boolean' for param[%d]", i),
-		// 		}
-		// 	}
-		// 	a, ok := reflect.as_bool(arg) // FIXME: prob not the fastest way to do this...
-		// 	append(&pd.values, u8(a))
-
-		// 	pd.lengths[i] = 1
-		// 	pd.formats[i] = pq.Format.Binary
-
-		// 	case:
-		// 		// TODO: other main oids eg bytea, jsonb etc
-		// 		delete(pd.values);delete(pd.lengths);delete(pd.formats)
-		// 		return pd, DB_Error {
-		// 			kind = .UnknownOID,
-		// 			msg = fmt.tprintf("Unsupported OID '%d' for param[%d]", param_types[i], i),
-		// 		}
-		// 	}
-	}
-	return pd, nil
+}
+delete_param_data::proc(pd:^Param_Data) {
+	delete(pd.values)
+	delete(pd.lengths)
+	delete(pd.formats)
 }
 
 
@@ -1039,6 +813,7 @@ scan :: proc(
 }
 // unimplemented("needs some more thought, cannot pass a maybe, i think..?")
 
+// Utilizes RTTI to automatically match types by name; use `pg:` tags to otherwise match the names
 scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T {
 	cols := get_pg_columns(T) // get `pg:` tagged columns
 	defer delete(cols)
@@ -1219,55 +994,6 @@ parse_text :: proc(str: string, $T: typeid, allocator:=context.allocator) -> (va
 	return val, .UnknownType
 
 }
-
-@(private)
-format_sql_with_args :: proc(sql: string, args: ..any) -> string {
-	sb := strings.builder_make()
-
-	arg_index := 0
-	start := 0
-
-	for i := 1;; i += 1 {
-		placeholder := fmt.tprintf("$%d", i)
-		dollar := strings.index(sql[start:], placeholder)
-		end := start + dollar
-
-		if dollar < 0 {
-			strings.write_string(&sb, sql[start:])
-			break
-		}
-
-		strings.write_string(&sb, sql[start:end])
-
-		if arg_index >= len(args) {
-			fmt.eprintln("Not enough arguments for placeholders")
-			return ""
-		}
-		strings.write_string(&sb, convert_to_sql_value(args[arg_index]))
-		arg_index += 1
-
-		start += dollar + len(placeholder)
-	}
-
-	return strings.to_string(sb)
-}
-
-@(private)
-convert_to_sql_value :: proc(arg: any) -> string {
-	switch a in arg {
-	case string:
-		return fmt.aprintf("'%s'", a)
-	case int, i8, i16, i32, i64:
-		return fmt.aprintf("%d", a)
-	case uint, u8, u16, u32, u64:
-		return fmt.aprintf("%d", a)
-	case f16, f32, f64:
-		return fmt.aprintf("%v", a)
-	case:
-		return "NULL"
-	}
-}
-
 
 
 count_args :: proc(query: string) -> int {
