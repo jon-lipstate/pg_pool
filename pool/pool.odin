@@ -55,6 +55,9 @@ Connection :: struct {
 	arena_size:  uint, // Total arena size allocated
 	peak_used:   uint, // High water mark for this connection
 	last_used:   uint, // Memory used by last query
+	// Transaction state
+	transaction_depth: int,  // 0 = no tx, 1 = BEGIN, 2+ = savepoints
+	in_use_by_tx: bool,  // True when connection is held by a transaction
 }
 
 // Postgres integers: 
@@ -231,9 +234,13 @@ acquire :: proc(allocation_size: uint = 16 * mem.Kilobyte) -> (^Connection, Erro
 }
 
 release :: proc(cnx: ^Connection) -> Error {
+	if cnx == nil || cnx.cnx == nil {
+		// Already released or nil connection
+		return nil
+	}
+	
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
-	assert(cnx != nil, "release() on a nil connection")
 
 	// Track memory usage before clearing
 	cnx.last_used = uint(cnx.arena.offset)
@@ -442,6 +449,7 @@ Rows :: struct {
 	current_row: int,
 	columns:     []Column_Metadata,
 	row_count:   int,
+	owns_connection: bool,  // If true, release connection when done
 }
 Column_Metadata :: struct {
 	name:      string,
@@ -452,6 +460,7 @@ Column_Metadata :: struct {
 
 query :: proc(
 	sql: string,
+	cnx: ^Connection = nil,
 	arena_size: uint = 64 * mem.Kilobyte,
 	types: []Postgres_Type = nil,
 	args: ..any,
@@ -459,12 +468,26 @@ query :: proc(
 	Rows,
 	Error,
 ) {
-	cnx, err := acquire(arena_size)
-	if err != nil {
-		fmt.eprintln("query error:", err)
-		return {}, .FailedToAcquireConnection
+	// Check if connection was already released
+	if cnx != nil && cnx.cnx == nil {
+		return {}, db_error(.ConnectionError, "Connection already released")
 	}
-	context.allocator = cnx.allocator // Use the connection's arena
+	
+	should_release := false
+	actual_cnx := cnx
+	if actual_cnx == nil {
+		// No connection provided, acquire from pool
+		err: Error
+		actual_cnx, err = acquire(arena_size)
+		if err != nil {
+			fmt.eprintln("query error:", err)
+			return {}, .FailedToAcquireConnection
+		}
+		should_release = true
+		context.allocator = actual_cnx.allocator // Use the connection's arena
+	} else {
+		actual_cnx = cnx
+	}
 
 	c_sql := strings.clone_to_cstring(sql)
 	n_args := count_args(sql)
@@ -483,18 +506,8 @@ query :: proc(
 	p_values := n_args > 0 ? transmute([^][^]byte)&value_ptrs[0] : nil
 	defer if value_ptrs != nil {delete(value_ptrs)}
 
-	// offset:=0
-	// fmt.println("Parameter Details:")
-	// for i in 0 ..< len(ep.types) {
-	// 	fmt.printf("  Param %d:\n", i)
-	// 	fmt.printf("    Type (OID): %d\n", ep.types[i])
-	// 	fmt.printf("    Length: %d\n", ep.lengths[i])
-	// 	fmt.printf("    Format: %v\n", ep.formats[i])
-	// 	fmt.printf("    Value (hex): %x\n", ep.values[i:offset + int(pd.lengths[i])])
-	// offset+=int(pd.lengths[i])
-	// }
 	result := pq.exec_params(
-		cnx.cnx,
+		actual_cnx.cnx,
 		c_sql,
 		i32(n_args),
 		p_types,
@@ -505,11 +518,25 @@ query :: proc(
 	) // FIXME: SWITCH TO BINARY RETURNS
 
 	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
-		err := db_error_from_msg(cnx)
-		release(cnx)
+		err := db_error_from_msg(actual_cnx)
+		if should_release {
+			release(actual_cnx)
+		}
 		return {}, err
 	}
-	return result_into_rows(cnx, result)
+	
+	rows, rows_err := result_into_rows(actual_cnx, result)
+	if rows_err != nil {
+		if should_release {
+			release(actual_cnx)
+		}
+		return {}, rows_err
+	}
+	// If we acquired from pool, mark rows to release connection when done
+	if should_release {
+		rows.owns_connection = true
+	}
+	return rows, nil
 }
 
 Exec_Params :: struct {
@@ -627,11 +654,40 @@ copy_into_buf :: proc(
 	buf: ^[dynamic]byte,
 	arg: any,
 	oid: pq.OID,
+	format: pq.Format,
 	tid: ^Postgres_Type = nil,
 ) -> (
 	size: i32,
 	err: Error,
 ) {
+	// For text format, convert to string representation
+	if format == .Text {
+		str: string
+		switch v in arg {
+		case string:
+			str = v
+		case int, i32, i64, i16, i8:
+			str = fmt.tprintf("%d", extract_int(arg))
+		case uint, u32, u64, u16, u8:
+			str = fmt.tprintf("%d", arg)
+		case f32:
+			str = fmt.tprintf("%f", v)
+		case f64:
+			str = fmt.tprintf("%f", v)
+		case bool:
+			str = v ? "t" : "f"
+		case:
+			return 0, .UnknownType
+		}
+		p_bytes := transmute([]byte)str
+		append(buf, ..p_bytes)
+		// Add null terminator for text format - PostgreSQL expects C strings
+		append(buf, 0)
+		// Return length WITHOUT the null terminator
+		return i32(len(str)), nil
+	}
+	
+	// Binary format encoding
 	switch oid {
 	case OID_BOOL:
 		append(buf, transmute(byte)extract_bool(arg))
@@ -666,7 +722,6 @@ copy_into_buf :: proc(
 		append(buf, ..p_bytes)
 		size = i32(len(str))
 	case:
-		// ep.formats[i] = .Text
 		err = .UnknownType
 	}
 	return
@@ -681,16 +736,17 @@ set_exec_param :: proc(
 	err: Error,
 ) {
 	oid: pq.OID
-	format: pq.Format = .Binary
+	// Use text format for all types until binary encoding is debugged
+	format: pq.Format = .Text
 	if type != nil {
 		oid = type.oid
 		format = type.format
 	} else {
 		oid = get_oid(param.id)
 	}
-	ep.formats[i] = format
 	ep.types[i] = oid
-	ep.lengths[i], err = copy_into_buf(&ep.values, param, oid, type)
+	ep.formats[i] = format
+	ep.lengths[i], err = copy_into_buf(&ep.values, param, oid, format, type)
 	if err != nil {return}
 
 	return
@@ -708,8 +764,20 @@ get_value_ptrs :: proc(
 
 	offset := 0
 	for length, i in lens {
-		buf[i] = &backing[offset]
-		offset += int(length)
+		if length == 0 {
+			// For zero-length parameters (empty strings), use nil
+			buf[i] = nil
+		} else {
+			if offset >= len(backing) {
+				fmt.eprintln("ERROR: offset", offset, ">= backing len", len(backing), "at param", i)
+				fmt.eprintln("Lengths:", lens)
+				panic("Buffer overflow in get_value_ptrs")
+			}
+			buf[i] = &backing[offset]
+			// Skip past the data AND the null terminator for text format
+			// The length doesn't include the null terminator, but it's in the buffer
+			offset += int(length) + 1  // +1 for null terminator
+		}
 	}
 
 	return buf[:]
@@ -820,11 +888,12 @@ exec_prepared :: proc(
 	oids := extract_oids(stmt.arg_types);defer delete(oids) // cache this..?
 
 	for arg, i in args {
-		writing_type, _ := stmt.arg_types[i].(Postgres_Type)
-		size, err := copy_into_buf(&pd.values, arg, oids[i], &writing_type)
+		writing_type, ok := stmt.arg_types[i].(Postgres_Type)
+		format := ok && writing_type.format != {} ? writing_type.format : .Text
+		size, err := copy_into_buf(&pd.values, arg, oids[i], format, ok ? &writing_type : nil)
 		if err != nil {return {}, err}
 		pd.lengths[i] = size
-		pd.formats[i] = .Binary
+		pd.formats[i] = format
 	}
 
 	p_lens := n_args > 0 ? &pd.lengths[0] : nil
@@ -832,17 +901,6 @@ exec_prepared :: proc(
 	value_ptrs := get_value_ptrs(pd.values, pd.lengths)
 	p_values := n_args > 0 ? transmute([^][^]byte)&value_ptrs[0] : nil
 	defer if value_ptrs != nil {delete(value_ptrs)}
-	fmt.println("VALUES", pd.values)
-	fmt.println("Parameter Details:")
-	offset := 0
-	for i in 0 ..< len(pd.lengths) {
-		fmt.printf("  Param %d:\n", i)
-		fmt.printf("    Type (OID): %d\n", cast(PG_OID)oids[i])
-		fmt.printf("    Length: %d\n", pd.lengths[i])
-		fmt.printf("    Format: %v\n", pd.formats[i])
-		fmt.printf("    Value (hex): %x\n", pd.values[i:offset + int(pd.lengths[i])])
-		offset += int(pd.lengths[i])
-	}
 
 	result := pq.exec_prepared(
 		stmt.cnx.cnx,
@@ -932,7 +990,10 @@ release_query :: proc(rows: ^Rows) {
 		pq.clear(rows.result)
 	}
 	// delete(rows.columns) // not needed, part of arena
-	release(rows.cnx)
+	// Only release connection if we own it (acquired from pool for this query)
+	if rows.owns_connection {
+		release(rows.cnx)
+	}
 }
 
 // Advance to the next row. Must be called before first scan.
@@ -954,6 +1015,7 @@ next_row :: proc(rows: ^Rows) -> (ok: bool) {
 query_row_into :: proc(
 	sql: string,
 	$T: typeid,
+	cnx: ^Connection = nil,
 	arena_size: uint = 16 * mem.Kilobyte,
 	types: []Postgres_Type = nil,
 	args: ..any,
@@ -961,7 +1023,7 @@ query_row_into :: proc(
 	result: T,
 	err: Error,
 ) {
-	rows, qerr := query(sql, arena_size, types, args = args)
+	rows, qerr := query(sql, cnx, arena_size, types, args = args)
 	if qerr != nil {return {}, qerr}
 	defer release_query(&rows)
 
@@ -1184,7 +1246,7 @@ get_pg_columns :: proc(T: typeid) -> []PG_Col {
 		field := rf.struct_field_at(T, i)
 
 		tag_str := string(tag)
-		pg_i := strings.index(tag_str, "pg:")
+		pg_i := strings.index(tag_str, "pg:\"")
 		if pg_i != -1 {
 			s_at_pg := tag_str[pg_i + 4:] // Skip "pg:\""
 			q_i := strings.index(s_at_pg, "\"")
@@ -1192,6 +1254,13 @@ get_pg_columns :: proc(T: typeid) -> []PG_Col {
 				pg_name := s_at_pg[:q_i]
 				pg_cols[i] = PG_Col {
 					name  = pg_name,
+					index = i,
+					field = field,
+				}
+			} else {
+				// Malformed tag, use field name
+				pg_cols[i] = PG_Col {
+					name  = field.name,
 					index = i,
 					field = field,
 				}
@@ -1259,6 +1328,7 @@ parse_text :: proc(
 // Helper for single-row queries
 query_row :: proc(
 	sql: string,
+	cnx: ^Connection = nil,
 	arena_size: uint = 16 * mem.Kilobyte,
 	types: []Postgres_Type = nil,
 	args: ..any,
@@ -1266,7 +1336,7 @@ query_row :: proc(
 	Rows,
 	Error,
 ) {
-	rows, err := query(sql, arena_size, types, args = args)
+	rows, err := query(sql, cnx, arena_size, types, args = args)
 	if err != nil {return {}, err}
 	if rows.row_count == 0 {
 		release_query(&rows)
@@ -1282,18 +1352,33 @@ query_row :: proc(
 // Execute a query that doesn't return rows (INSERT/UPDATE/DELETE)
 exec :: proc(
 	sql: string,
+	cnx: ^Connection = nil,
 	types: []Postgres_Type = nil,
 	args: ..any,
 ) -> (
 	affected_rows: int,
 	err: Error,
 ) {
-	cnx, acq_err := acquire()
-	if acq_err != nil {
-		return 0, acq_err
+	// Check if connection was already released
+	if cnx != nil && cnx.cnx == nil {
+		return 0, db_error(.ConnectionError, "Connection already released")
 	}
-	defer release(cnx)
-	context.allocator = cnx.allocator
+	
+	should_release := false
+	actual_cnx := cnx
+	if actual_cnx == nil {
+		// No connection provided, acquire from pool
+		acq_err: Error
+		actual_cnx, acq_err = acquire()
+		if acq_err != nil {
+			return 0, acq_err
+		}
+		should_release = true
+		defer if should_release { release(actual_cnx) }
+		context.allocator = actual_cnx.allocator
+	} else {
+		actual_cnx = cnx
+	}
 
 	c_sql := strings.clone_to_cstring(sql)
 	n_args := count_args(sql)
@@ -1312,8 +1397,9 @@ exec :: proc(
 	p_values := n_args > 0 ? transmute([^][^]byte)&value_ptrs[0] : nil
 	defer if value_ptrs != nil {delete(value_ptrs)}
 
+
 	result := pq.exec_params(
-		cnx.cnx,
+		actual_cnx.cnx,
 		c_sql,
 		i32(n_args),
 		p_types,
@@ -1341,6 +1427,124 @@ exec :: proc(
 		return affected, nil
 	}
 	return 0, nil
+}
+
+// Begin a transaction, or create a savepoint if already in a transaction
+begin :: proc(cnx: ^Connection = nil) -> (^Connection, Error) {
+	if cnx == nil {
+		// New transaction - acquire connection and BEGIN
+		err: Error
+		new_cnx: ^Connection
+		new_cnx, err = acquire()
+		if err != nil {
+			return nil, err
+		}
+		
+		result := pq.exec(new_cnx.cnx, "BEGIN")
+		if result == nil {
+			release(new_cnx)
+			return nil, db_error_from_msg(new_cnx)
+		}
+		pq.clear(result)
+		
+		new_cnx.transaction_depth = 1
+		new_cnx.in_use_by_tx = true
+		return new_cnx, nil
+	} else if cnx.transaction_depth > 0 {
+		// Nested transaction - use savepoint
+		cnx.transaction_depth += 1
+		savepoint_name := fmt.tprintf("sp_%d", cnx.transaction_depth)
+		
+		c_sql := strings.clone_to_cstring(fmt.tprintf("SAVEPOINT %s", savepoint_name))
+		defer delete(c_sql)
+		result := pq.exec(cnx.cnx, c_sql)
+		if result == nil {
+			return nil, db_error_from_msg(cnx)
+		}
+		pq.clear(result)
+		
+		return cnx, nil
+	} else {
+		// Connection exists but not in transaction - start one
+		result := pq.exec(cnx.cnx, "BEGIN")
+		if result == nil {
+			return nil, db_error_from_msg(cnx)
+		}
+		pq.clear(result)
+		
+		cnx.transaction_depth = 1
+		cnx.in_use_by_tx = true
+		return cnx, nil
+	}
+}
+
+// Commit a transaction or release a savepoint
+commit :: proc(cnx: ^Connection) -> Error {
+	if cnx == nil || cnx.cnx == nil {
+		return db_error(.ConnectionError, "Connection already released")
+	}
+	if !cnx.in_use_by_tx {
+		return db_error(.ConnectionError, "Connection not owned by transaction")
+	}
+	if cnx.transaction_depth == 0 {
+		return db_error(.ConnectionError, "Not in a transaction")
+	}
+	
+	if cnx.transaction_depth > 1 {
+		// Release savepoint
+		savepoint_name := fmt.tprintf("sp_%d", cnx.transaction_depth)
+		c_sql := strings.clone_to_cstring(fmt.tprintf("RELEASE SAVEPOINT %s", savepoint_name))
+		defer delete(c_sql)
+		result := pq.exec(cnx.cnx, c_sql)
+		if result == nil {
+			return db_error_from_msg(cnx)
+		}
+		pq.clear(result)
+		cnx.transaction_depth -= 1
+	} else {
+		// Commit actual transaction
+		result := pq.exec(cnx.cnx, "COMMIT")
+		if result == nil {
+			return db_error_from_msg(cnx)
+		}
+		pq.clear(result)
+		cnx.transaction_depth = 0
+		cnx.in_use_by_tx = false
+		release(cnx)
+	}
+	return nil
+}
+
+// Rollback a transaction or to a savepoint
+// Safe to call after commit (will be a no-op)
+rollback :: proc(cnx: ^Connection) -> Error {
+	if cnx == nil || cnx.cnx == nil || !cnx.in_use_by_tx || cnx.transaction_depth == 0 {
+		return nil  // Safe no-op for defer pattern
+	}
+	
+	if cnx.transaction_depth > 1 {
+		// Rollback to savepoint
+		savepoint_name := fmt.tprintf("sp_%d", cnx.transaction_depth)
+		c_sql := strings.clone_to_cstring(fmt.tprintf("ROLLBACK TO SAVEPOINT %s", savepoint_name))
+		defer delete(c_sql)
+		result := pq.exec(cnx.cnx, c_sql)
+		if result == nil {
+			return db_error_from_msg(cnx)
+		}
+		pq.clear(result)
+		cnx.transaction_depth -= 1
+	} else {
+		// Rollback entire transaction
+		result := pq.exec(cnx.cnx, "ROLLBACK")
+		// Even if this fails, we still release the connection
+		if result != nil {
+			pq.clear(result)
+		}
+		cnx.transaction_depth = 0
+		cnx.in_use_by_tx = false
+		release(cnx)
+	}
+	return nil
 }
 
 // Search Query-String for the highest value of $i

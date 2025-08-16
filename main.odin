@@ -26,22 +26,22 @@ main :: proc() {
 	}
 }
 
-// Test structures
+// Test structures with pg tags for database column mapping
 User :: struct {
-	id:         int,
-	email:      string,
-	name:       string,
-	age:        int,
-	is_active:  bool,
-	created_at: string, // TODO: time.Time when supported
+	id:         int `pg:"id"`,
+	email:      string `pg:"email"`,
+	full_name:  string `pg:"name"`, // Struct field differs from DB column
+	age:        int `pg:"age"`,
+	active:     bool `pg:"is_active"`, // Struct field differs from DB column
+	created_at: string `pg:"created_at"`,
 }
 
 Product :: struct {
-	id:          int,
-	name:        string,
-	price:       f64,
-	stock:       int,
-	description: string,
+	product_id:   int `pg:"id"`, // Struct field differs from DB column
+	product_name: string `pg:"name"`, // Struct field differs from DB column  
+	price:        f64 `pg:"price"`,
+	stock_count:  int `pg:"stock"`, // Struct field differs from DB column
+	desc:         string `pg:"description"`, // Struct field differs from DB column
 }
 
 _main :: proc() {
@@ -128,8 +128,11 @@ test_basic_queries :: proc() {
 		"INSERT INTO test_users (email, name, age) VALUES ($1, $2, $3)",
 		args = {"alice@example.com", "Alice", 30},
 	)
+	if err != nil {
+		fmt.eprintln("Failed to insert user:", err)
+		return
+	}
 	fmt.printf("Inserted %d user(s)\n", affected)
-	assert(err == nil)
 
 	// Query the user back
 	rows, err2 := pool.query(
@@ -152,6 +155,17 @@ test_basic_queries :: proc() {
 test_parameterized_queries :: proc() {
 	fmt.println("\n=== Testing Parameterized Queries ===")
 
+	// Test simple string insert first
+	_, err := pool.exec(
+		"INSERT INTO test_products (name, price, stock) VALUES ($1, $2, $3)",
+		args = {"TestProduct", 99.99, 10},
+	)
+	if err != nil {
+		fmt.eprintln("Failed to insert test product:", err)
+		return
+	}
+	fmt.println("Successfully inserted test product")
+
 	// Insert multiple products
 	products := []struct {
 		name:  string,
@@ -160,10 +174,25 @@ test_parameterized_queries :: proc() {
 	}{{"Laptop", 999.99, 10}, {"Mouse", 29.99, 100}, {"Keyboard", 79.99, 50}}
 
 	for p in products {
-		pool.exec(
+		_, err := pool.exec(
 			"INSERT INTO test_products (name, price, stock) VALUES ($1, $2, $3)",
 			args = {p.name, p.price, p.stock},
 		)
+		if err != nil {
+			fmt.eprintln("Failed to insert product", p.name, ":", err)
+		}
+	}
+
+	// First check what we actually inserted
+	check_rows, _ := pool.query("SELECT id, name, price, stock FROM test_products ORDER BY id")
+	defer pool.release_query(&check_rows)
+	fmt.println("\nActual products in database:")
+	for pool.next_row(&check_rows) {
+		id, _ := pool.scan(&check_rows, int, 0)
+		name, _ := pool.scan(&check_rows, string, 1)
+		price, _ := pool.scan(&check_rows, f64, 2)
+		stock, _ := pool.scan(&check_rows, int, 3)
+		fmt.printf("  id=%d, name=%s, price=%.2f, stock=%d\n", id, name, price, stock)
 	}
 
 	// Query products with price filter
@@ -211,12 +240,18 @@ test_null_handling :: proc() {
 test_transactions :: proc() {
 	fmt.println("\n=== Testing Transactions ===")
 
-	// Note: Transaction support would need to be added to the pool
-	// For now, just test multiple operations
+	// Test basic transaction
+	tx, err := pool.begin()
+	if err != nil {
+		fmt.eprintln("Failed to begin transaction:", err)
+		return
+	}
+	defer pool.rollback(tx)  // Safety net - no-op if committed
 
 	// Check current stock
 	rows, _ := pool.query(
 		"SELECT name, stock FROM test_products WHERE name = $1",
+		tx,  // Use transaction connection
 		args = {"Laptop"},
 	)
 	defer pool.release_query(&rows)
@@ -226,22 +261,90 @@ test_transactions :: proc() {
 		stock, _ := pool.scan(&rows, int, 1)
 		fmt.printf("Current stock for %s: %d\n", name, stock)
 
-		// Update stock
+		// Update stock within transaction
 		pool.exec(
 			"UPDATE test_products SET stock = stock - $1 WHERE name = $2",
+			tx,  // Use transaction connection
 			args = {2, "Laptop"},
 		)
 
-		// Check new stock
+		// Check new stock within same transaction
 		rows2, _ := pool.query(
 			"SELECT stock FROM test_products WHERE name = $1",
+			tx,  // Use transaction connection
 			args = {"Laptop"},
 		)
 		defer pool.release_query(&rows2)
 		if pool.next_row(&rows2) {
 			new_stock, _ := pool.scan(&rows2, int, 0)
-			fmt.printf("New stock: %d\n", new_stock)
+			fmt.printf("New stock (in tx): %d\n", new_stock)
 		}
+	}
+
+	// Commit the transaction
+	if err := pool.commit(tx); err != nil {
+		fmt.eprintln("Failed to commit:", err)
+		return
+	}
+	fmt.println("Transaction committed successfully")
+
+	// Test nested transactions with savepoints
+	test_nested_transactions()
+}
+
+test_nested_transactions :: proc() {
+	fmt.println("\n=== Testing Nested Transactions (Savepoints) ===")
+	
+	// Start outer transaction
+	tx1, err := pool.begin()
+	if err != nil {
+		fmt.eprintln("Failed to begin transaction:", err)
+		return
+	}
+	defer pool.rollback(tx1)
+
+	// Insert a new user in outer transaction
+	pool.exec(
+		"INSERT INTO test_users (email, name, age) VALUES ($1, $2, $3)",
+		tx1,
+		args = {"charlie@example.com", "Charlie", 35},
+	)
+	fmt.println("Inserted Charlie in outer transaction")
+
+	// Start nested transaction (savepoint)
+	tx2, err2 := pool.begin(tx1)
+	if err2 != nil {
+		fmt.eprintln("Failed to create savepoint:", err2)
+		return
+	}
+
+	// Insert another user in nested transaction
+	pool.exec(
+		"INSERT INTO test_users (email, name, age) VALUES ($1, $2, $3)",
+		tx2,
+		args = {"david@example.com", "David", 40},
+	)
+	fmt.println("Inserted David in nested transaction")
+
+	// Rollback nested transaction (David should be rolled back)
+	pool.rollback(tx2)
+	fmt.println("Rolled back nested transaction (David)")
+
+	// Charlie should still be there, commit outer transaction
+	pool.commit(tx1)
+	fmt.println("Committed outer transaction (Charlie)")
+
+	// Verify results
+	rows, _ := pool.query(
+		"SELECT name FROM test_users WHERE email IN ($1, $2) ORDER BY name",
+		args = {"charlie@example.com", "david@example.com"},
+	)
+	defer pool.release_query(&rows)
+
+	fmt.println("Users after nested transaction test:")
+	for pool.next_row(&rows) {
+		name, _ := pool.scan(&rows, string, 0)
+		fmt.printf("  - %s\n", name)
 	}
 }
 
@@ -252,17 +355,18 @@ test_struct_scanning :: proc() {
 	user, err := pool.query_row_into(
 		"SELECT id, email, name, age, is_active FROM test_users WHERE email = $1",
 		User,
+		nil,  // No specific connection, will acquire from pool
 		args = {"alice@example.com"},
 	)
 
 	if err == nil {
 		fmt.printf(
-			"Struct scan: User{{id=%d, email=%s, name=%s, age=%d, active=%v}}\n",
+			"Struct scan: User{{id=%d, email=%s, full_name=%s, age=%d, active=%v}}\n",
 			user.id,
 			user.email,
-			user.name,
+			user.full_name,
 			user.age,
-			user.is_active,
+			user.active,
 		)
 	} else {
 		fmt.println("Failed to scan into struct:", err)
@@ -278,11 +382,12 @@ test_struct_scanning :: proc() {
 	for pool.next_row(&rows) {
 		product := pool.scan_into(&rows, Product)
 		fmt.printf(
-			"  Product{{id=%d, name=%s, price=%.2f, stock=%d}}\n",
-			product.id,
-			product.name,
+			"  Product{{id=%d, name=%s, price=%.2f, stock=%d, desc=%s}}\n",
+			product.product_id,
+			product.product_name,
 			product.price,
-			product.stock,
+			product.stock_count,
+			product.desc,
 		)
 	}
 }
