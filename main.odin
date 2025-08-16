@@ -8,7 +8,7 @@ import "core:strings"
 import "env"
 import "pool"
 
-PRINT_TRACKING :: false
+PRINT_TRACKING :: true
 
 main :: proc() {
 	tracker: mem.Tracking_Allocator
@@ -149,6 +149,8 @@ test_basic_queries :: proc() {
 		age, _ := pool.scan(&rows, int, 3)
 
 		fmt.printf("User: id=%d, email=%s, name=%s, age=%d\n", id, email, name, age)
+		delete(email)
+		delete(name)
 	}
 }
 
@@ -157,8 +159,8 @@ test_parameterized_queries :: proc() {
 
 	// Test simple string insert first
 	_, err := pool.exec(
-		"INSERT INTO test_products (name, price, stock) VALUES ($1, $2, $3)",
-		args = {"TestProduct", 99.99, 10},
+		"INSERT INTO test_products (name, price, stock, description) VALUES ($1, $2, $3, $4)",
+		args = {"TestProduct", 99.99, 10, "desc"},
 	)
 	if err != nil {
 		fmt.eprintln("Failed to insert test product:", err)
@@ -193,6 +195,7 @@ test_parameterized_queries :: proc() {
 		price, _ := pool.scan(&check_rows, f64, 2)
 		stock, _ := pool.scan(&check_rows, int, 3)
 		fmt.printf("  id=%d, name=%s, price=%.2f, stock=%d\n", id, name, price, stock)
+		delete(name)
 	}
 
 	// Query products with price filter
@@ -207,33 +210,75 @@ test_parameterized_queries :: proc() {
 		name, _ := pool.scan(&rows, string, 0)
 		price, _ := pool.scan(&rows, f64, 1)
 		fmt.printf("  - %s: $%.2f\n", name, price)
+		delete(name)
 	}
 }
 
 test_null_handling :: proc() {
 	fmt.println("\n=== Testing NULL Handling ===")
 
-	// Insert user with NULL age
+	// Test auto-detection of NULL for nil pointer
+	age_ptr: ^int = nil // nil pointer
+	age_value := 25
+	age_ptr_valid := &age_value
+
+	// Insert user with NULL age using nil pointer
 	pool.exec(
-		"INSERT INTO test_users (email, name, age) VALUES ($1, $2, NULL)",
-		args = {"bob@example.com", "Bob"},
+		"INSERT INTO test_users (email, name, age) VALUES ($1, $2, $3)",
+		args = {"bob@example.com", "Bob", age_ptr}, // nil pointer = NULL
 	)
 
+	// Insert user with valid age using pointer
+	pool.exec(
+		"INSERT INTO test_users (email, name, age) VALUES ($1, $2, $3)",
+		args = {"carol@example.com", "Carol", age_ptr_valid}, // non-nil pointer
+	)
+
+	// Test nil slice = NULL
+	tags: []string = nil // nil slice
+	pool.exec(
+		"INSERT INTO test_products (name, price, stock, description) VALUES ($1, $2, $3, $4)",
+		args = {"NullProduct", 10.0, 5, tags}, // nil slice = NULL
+	)
+
+	// Query back and verify
 	rows, _ := pool.query(
-		"SELECT name, age FROM test_users WHERE email = $1",
-		args = {"bob@example.com"},
+		"SELECT name, age FROM test_users WHERE email IN ($1, $2) ORDER BY name",
+		args = {"bob@example.com", "carol@example.com"},
 	)
 	defer pool.release_query(&rows)
 
-	if pool.next_row(&rows) {
+	fmt.println("Users with auto-detected NULL:")
+	for pool.next_row(&rows) {
 		name, _ := pool.scan(&rows, string, 0)
 		age, age_err := pool.scan(&rows, int, 1)
 
 		if age_err == .UnexpectedNullValue {
-			fmt.printf("%s has NULL age\n", name)
+			fmt.printf("  %s has NULL age\n", name)
 		} else {
-			fmt.printf("%s is %d years old\n", name, age)
+			fmt.printf("  %s is %d years old\n", name, age)
 		}
+		delete(name)
+	}
+
+	// Check the product with NULL description
+	rows2, _ := pool.query(
+		"SELECT name, description FROM test_products WHERE name = $1",
+		args = {"NullProduct"},
+	)
+	defer pool.release_query(&rows2)
+
+	if pool.next_row(&rows2) {
+		prod_name, _ := pool.scan(&rows2, string, 0)
+		desc, desc_err := pool.scan(&rows2, string, 1)
+
+		if desc_err == .UnexpectedNullValue {
+			fmt.printf("  %s has NULL description\n", prod_name)
+		} else {
+			fmt.printf("  %s description: %s\n", prod_name, desc)
+			delete(desc)
+		}
+		delete(prod_name)
 	}
 }
 
@@ -246,32 +291,33 @@ test_transactions :: proc() {
 		fmt.eprintln("Failed to begin transaction:", err)
 		return
 	}
-	defer pool.rollback(tx)  // Safety net - no-op if committed
+	defer pool.rollback(tx) // Safety net - no-op if committed
 
 	// Check current stock
 	rows, _ := pool.query(
 		"SELECT name, stock FROM test_products WHERE name = $1",
-		tx,  // Use transaction connection
+		tx, // Use transaction connection
 		args = {"Laptop"},
 	)
 	defer pool.release_query(&rows)
 
 	if pool.next_row(&rows) {
 		name, _ := pool.scan(&rows, string, 0)
+		defer delete(name)
 		stock, _ := pool.scan(&rows, int, 1)
 		fmt.printf("Current stock for %s: %d\n", name, stock)
 
 		// Update stock within transaction
 		pool.exec(
 			"UPDATE test_products SET stock = stock - $1 WHERE name = $2",
-			tx,  // Use transaction connection
+			tx, // Use transaction connection
 			args = {2, "Laptop"},
 		)
 
 		// Check new stock within same transaction
 		rows2, _ := pool.query(
 			"SELECT stock FROM test_products WHERE name = $1",
-			tx,  // Use transaction connection
+			tx, // Use transaction connection
 			args = {"Laptop"},
 		)
 		defer pool.release_query(&rows2)
@@ -294,7 +340,7 @@ test_transactions :: proc() {
 
 test_nested_transactions :: proc() {
 	fmt.println("\n=== Testing Nested Transactions (Savepoints) ===")
-	
+
 	// Start outer transaction
 	tx1, err := pool.begin()
 	if err != nil {
@@ -345,6 +391,7 @@ test_nested_transactions :: proc() {
 	for pool.next_row(&rows) {
 		name, _ := pool.scan(&rows, string, 0)
 		fmt.printf("  - %s\n", name)
+		delete(name)
 	}
 }
 
@@ -355,7 +402,7 @@ test_struct_scanning :: proc() {
 	user, err := pool.query_row_into(
 		"SELECT id, email, name, age, is_active FROM test_users WHERE email = $1",
 		User,
-		nil,  // No specific connection, will acquire from pool
+		nil, // No specific connection, will acquire from pool
 		args = {"alice@example.com"},
 	)
 
@@ -368,6 +415,9 @@ test_struct_scanning :: proc() {
 			user.age,
 			user.active,
 		)
+		delete(user.email)
+		delete(user.full_name)
+		delete(user.created_at)
 	} else {
 		fmt.println("Failed to scan into struct:", err)
 	}
@@ -389,6 +439,11 @@ test_struct_scanning :: proc() {
 			product.stock_count,
 			product.desc,
 		)
+		delete(product.product_name)
+		if product.desc != "" {
+			delete(product.desc)
+		}
+
 	}
 }
 
@@ -400,6 +455,19 @@ test_pool_stats :: proc() {
 	fmt.printf("  Active connections: %d\n", stats.active_connections)
 	fmt.printf("  Idle connections: %d\n", stats.idle_connections)
 	fmt.printf("  Total connections: %d\n", stats.total_connections)
-	fmt.printf("  Peak memory used: %d KB\n", stats.peak_memory_used / 1024)
-	fmt.printf("  Average query memory: %d KB\n", stats.avg_last_used / 1024)
+	fmt.printf(
+		"  Peak memory used: %d bytes (%d KB)\n",
+		stats.peak_memory_used,
+		stats.peak_memory_used / 1024,
+	)
+	fmt.printf(
+		"  Average query memory: %d bytes (%d KB)\n",
+		stats.avg_last_used,
+		stats.avg_last_used / 1024,
+	)
+	fmt.printf(
+		"  Total memory allocated: %d bytes (%d KB)\n",
+		stats.total_memory,
+		stats.total_memory / 1024,
+	)
 }
