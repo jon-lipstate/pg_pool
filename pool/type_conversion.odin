@@ -283,6 +283,10 @@ copy_into_buf :: proc(
 	size: i32,
 	err: Error,
 ) {
+	// Check if we have a custom type with a writer
+	if tid != nil && tid.writer != nil {
+		return tid.writer(buf, arg, format), nil
+	}
 	// First check for nil-able types
 	actual_arg := arg
 	ti := type_info_of(actual_arg.id)

@@ -71,6 +71,7 @@ _main :: proc() {
 	test_null_handling()
 	test_transactions()
 	test_struct_scanning()
+	test_custom_types()
 	test_pool_stats()
 }
 
@@ -445,6 +446,85 @@ test_struct_scanning :: proc() {
 		}
 
 	}
+}
+
+test_custom_types :: proc() {
+	fmt.println("\n=== Testing Custom Types ===")
+	
+	// Create a table with UUID column
+	pool.exec("DROP TABLE IF EXISTS test_custom")
+	_, err := pool.exec(`
+		CREATE TABLE test_custom (
+			id SERIAL PRIMARY KEY,
+			uuid_field UUID,
+			json_field JSONB
+		)
+	`)
+	if err != nil {
+		fmt.eprintln("Failed to create custom types table:", err)
+		return
+	}
+	
+	// Define a custom UUID type handler
+	// UUID is stored as 16 bytes in binary format
+	uuid_type := pool.Postgres_Type{
+		oid = 2950, // UUID OID
+		format = .Text, // Use text format for simplicity
+		writer = proc(buf: ^[dynamic]byte, arg: any, format: pq.Format) -> (size: i32) {
+			// Expect a string UUID like "550e8400-e29b-41d4-a716-446655440000"
+			uuid_str := arg.(string)
+			p_bytes := transmute([]byte)uuid_str
+			append(buf, ..p_bytes)
+			append(buf, 0) // null terminator for text format
+			return i32(len(uuid_str))
+		},
+		reader = nil, // Not needed for this test
+	}
+	
+	// Test inserting with custom type
+	test_uuid := "550e8400-e29b-41d4-a716-446655440000"
+	_, err2 := pool.exec(
+		"INSERT INTO test_custom (uuid_field) VALUES ($1)",
+		types = {uuid_type},
+		args = {test_uuid},
+	)
+	if err2 != nil {
+		fmt.eprintln("Failed to insert with custom type:", err2)
+		return
+	}
+	
+	fmt.println("Successfully inserted UUID with custom type handler")
+	
+	// Query it back
+	rows, _ := pool.query("SELECT uuid_field FROM test_custom")
+	defer pool.release_query(&rows)
+	
+	if pool.next_row(&rows) {
+		uuid_result, _ := pool.scan(&rows, string, 0)
+		defer delete(uuid_result)
+		fmt.printf("Retrieved UUID: %s\n", uuid_result)
+		
+		if uuid_result == test_uuid {
+			fmt.println("Custom type round-trip successful!")
+		} else {
+			fmt.println("UUID mismatch!")
+		}
+	}
+	
+	// Example: Binary format custom type could be added for POINT, INET, etc.
+	// point_type := pool.Postgres_Type{
+	//     oid = 600,  // POINT OID
+	//     format = .Binary,
+	//     writer = proc(buf: ^[dynamic]byte, arg: any, format: pq.Format) -> (size: i32) {
+	//         point := arg.([2]f64)
+	//         // Write two float64 in network byte order
+	//         ...
+	//     },
+	// }
+	fmt.println("Custom type handlers allow extending supported PostgreSQL types")
+	
+	// Clean up
+	pool.exec("DROP TABLE test_custom")
 }
 
 test_pool_stats :: proc() {
