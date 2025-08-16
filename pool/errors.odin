@@ -5,11 +5,11 @@ import "core:mem"
 import "core:strings"
 
 
-db_error::proc(kind:DB_Error_Kind, msg:string)->Error{
-	db_err:=new(DB_Error)
-	db_err^ = DB_Error{
+db_error :: proc(kind: DB_Error_Kind, msg: string) -> Error {
+	db_err := new(DB_Error)
+	db_err^ = DB_Error {
 		kind = kind,
-		msg = msg,
+		msg  = msg,
 	}
 	return db_err
 }
@@ -47,6 +47,8 @@ QueryError :: enum {
 	FormattingError,
 	OutOfBounds,
 	PqErr,
+	NoRows,
+	UnexpectedNullValue,
 }
 
 PoolError :: enum {
