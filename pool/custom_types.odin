@@ -2,6 +2,7 @@ package pg_pool
 
 import pq "../vendor/odin-postgresql"
 import "core:fmt"
+import "core:mem"
 import "core:reflect"
 
 // TODO: investigate if its better to just register a Codec like pgx does:
@@ -27,7 +28,15 @@ import "core:reflect"
 //       addr: string `pg:"address:inet"`,  // INET type
 //   }
 buf_writer :: #type proc(buf: ^[dynamic]byte, arg: any, format: pq.Format) -> (size: i32)
-col_reader :: #type proc() -> any
+col_reader :: #type proc(
+	bytes: []byte,
+	oid: pq.OID,
+	text_mode: bool,
+	allocator: mem.Allocator,
+) -> (
+	val: any,
+	err: Error,
+)
 Type_Decl :: union {
 	typeid,
 	Postgres_Type,

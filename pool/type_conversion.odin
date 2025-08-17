@@ -12,30 +12,61 @@ import "core:strings"
 import "core:time"
 
 
-// Scan column - handles both nullable and non-nullable types
-// For pointer types: returns nil for NULL
-// For non-pointer types: errors on NULL
-//
-// IMPORTANT: Memory allocation behavior
-// - Strings and slices are allocated using the allocator parameter (defaults to context.allocator)
-// - These allocations are NOT tied to the query/connection lifetime
-// - Caller is responsible for freeing allocated memory or using an arena allocator
-//
-// Example with arena allocator (recommended for web handlers):
-//   arena: mem.Arena
-//   defer mem.arena_destroy(&arena)
-//   context.allocator = mem.arena_allocator(&arena)
-//   
-//   rows := pool.query("SELECT name FROM users")
-//   defer pool.release_query(&rows)
-//   name, _ := pool.scan(&rows, string, 0)  // allocated in arena
-//   // name is valid until arena is destroyed
-//
+/*
+Scan a single column value from the current row.
+
+Retrieves a typed value from the specified column of the current row.
+Supports all PostgreSQL basic types, arrays, custom types, and pointers for nullable fields.
+Strings and slices are allocated using the provided allocator.
+
+Inputs:
+- rows: Result set positioned at a valid row (after next_row())
+- T: Type to scan into (e.g., int, string, []int, ^string)
+- col: Column index (0-based)
+- allocator: Allocator for strings/slices (default: context.allocator)
+- custom_type: Optional custom type with reader for custom deserialization
+
+Returns:
+- val: The scanned value of type T
+- err: Error if type mismatch or conversion fails
+
+Usage:
+    rows, _ := pool.query("SELECT id, name, age FROM users")
+    defer pool.release_query(&rows)
+    
+    for pool.next_row(&rows) {
+        id, _ := pool.scan(&rows, int, 0)
+        name, _ := pool.scan(&rows, string, 1)  // allocates string
+        age, _ := pool.scan(&rows, ^int, 2)     // nullable field
+        defer delete(name)
+    }
+
+Custom Type Usage:
+    uuid_reader := pool.Postgres_Type{
+        reader = proc(bytes: []byte, oid: pq.OID, text_mode: bool, allocator: mem.Allocator) -> (any, Error) {
+            // Custom UUID parsing logic
+            return parse_uuid(bytes, allocator), nil
+        },
+    }
+    
+    uuid, _ := pool.scan(&rows, string, 0, custom_type = uuid_reader)
+
+Memory Management:
+- Strings and slices are allocated using the allocator parameter
+- These allocations are NOT tied to the query/connection lifetime
+- Caller is responsible for freeing allocated memory
+- Consider using an arena allocator for automatic cleanup
+
+Null Handling:
+- For pointer types: returns nil for NULL
+- For non-pointer types: returns UnexpectedNullValue error
+*/
 scan :: proc(
 	rows: ^Rows,
 	$T: typeid,
 	col: int,
 	allocator := context.allocator,
+	custom_type: Postgres_Type = {},
 ) -> (
 	val: T,
 	err: Error,
@@ -70,6 +101,40 @@ scan :: proc(
 	n_bytes := int(pq.get_length(rows.result, target_row, i32(col)))
 	ptr := pq.get_value(rows.result, target_row, i32(col))
 
+	// Check for custom type reader first
+	if custom_type.reader != nil {
+		// Prepare data for custom reader
+		data: []byte
+		if rows.columns[col].text_mode {
+			str := cast(string)cstring(ptr)
+			data = transmute([]byte)str
+		} else {
+			if n_bytes < 0 {
+				n_bytes = 0
+			}
+			data = ([^]byte)(ptr)[:n_bytes]
+		}
+
+		// Call custom reader
+		val, err := custom_type.reader(
+			data,
+			rows.columns[col].oid,
+			rows.columns[col].text_mode,
+			allocator,
+		)
+		if err != nil {
+			return {}, err
+		}
+
+		// Type assertion to expected type
+		if result, ok := val.(T); ok {
+			return result, nil
+		} else {
+			return {}, QueryError.TypeMismatch
+		}
+	}
+
+	// Default parsing
 	if rows.columns[col].text_mode {
 		str := cast(string)cstring(ptr)
 		return parse_text(str, T, allocator)
@@ -83,7 +148,49 @@ scan :: proc(
 	}
 }
 
-// Utilizes RTTI to automatically match types by name; use `pg:` tags to otherwise match the names
+/*
+Scan an entire row into a struct using reflection.
+
+Automatically maps database columns to struct fields by matching column names
+with field names or `pg:` tags. Supports basic types, slices, pointers, and time.Time.
+
+Inputs:
+- rows: Result set positioned at a valid row
+- T: Struct type to scan into
+- allocator: Allocator for strings/slices (default: context.allocator)
+
+Returns:
+- Instance of T with fields populated from the row
+
+Field Mapping:
+- Uses `pg:"column_name"` tag if present
+- Otherwise uses the struct field name
+- Unmatched columns are ignored
+- Unmatched fields retain zero values
+
+Supported Field Types:
+- Basic types: int, i32, i64, f32, f64, bool, string
+- Time: time.Time
+- Arrays: []int, []string, etc.
+- Pointers: ^int, ^string, etc. for nullable fields
+- Single-variant unions
+
+Usage:
+    User :: struct {
+        id:         int       `pg:"id"`,
+        email:      string    `pg:"email"`,
+        full_name:  string    `pg:"name"`,     // Maps to 'name' column
+        created_at: time.Time `pg:"created_at"`,
+        bio:        ^string   `pg:"bio"`,      // Nullable field
+    }
+    
+    user := pool.scan_into(&rows, User)
+    defer delete(user.email)
+    defer delete(user.full_name)
+    if user.bio != nil { defer delete(user.bio^) }
+
+Note: Caller must free allocated strings, slices, and pointer fields
+*/
 scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T {
 	cols := get_pg_columns(T) // get `pg:` tagged columns, or use struct field names
 	defer delete(cols)
@@ -170,7 +277,7 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 					// Handle slices - []int, []string, etc.
 					elem_type := ti.elem
 					elem_id := elem_type.id
-					
+
 					switch elem_id {
 					case typeid_of(i16):
 						value, err := scan(rows, []i16, i)
@@ -264,19 +371,19 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 						// ti is already Type_Info_Named in this context
 						base_type := runtime.type_info_base(ti.base)
 						#partial switch bt in base_type.variant {
-							case runtime.Type_Info_Integer:
-								// Handle as integer
-								value, err := scan(rows, int, i)
-								if err == nil {
-									// Use memcpy since we know the size matches
-									mem.copy(field_ptr, &value, base_type.size)
-								}
-							case runtime.Type_Info_String:
-								value, err := scan(rows, string, i)
-								if err == nil {
-									sp := cast(^string)(field_ptr)
-									sp^ = value
-								}
+						case runtime.Type_Info_Integer:
+							// Handle as integer
+							value, err := scan(rows, int, i)
+							if err == nil {
+								// Use memcpy since we know the size matches
+								mem.copy(field_ptr, &value, base_type.size)
+							}
+						case runtime.Type_Info_String:
+							value, err := scan(rows, string, i)
+							if err == nil {
+								sp := cast(^string)(field_ptr)
+								sp^ = value
+							}
 						case:
 							fmt.eprintln(
 								"Unsupported named type with base:",
@@ -288,7 +395,7 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 				case runtime.Type_Info_Pointer:
 					// Handle pointers for nullable fields
 					ptr_type := ti.elem
-					
+
 					// Check if the column is NULL first
 					if pq.get_is_null(rows.result, i32(rows.current_row), i32(i)) {
 						// Set pointer to nil for NULL values
@@ -297,7 +404,7 @@ scan_into :: proc(rows: ^Rows, $T: typeid, allocator := context.allocator) -> T 
 					} else {
 						// Allocate and scan the value
 						ptr_elem_id := ptr_type.id
-						
+
 						switch ptr_elem_id {
 						case typeid_of(int):
 							value, err := scan(rows, int, i)

@@ -16,7 +16,6 @@ This directory contains the test suite for the PostgreSQL connection pool librar
 ### Test Infrastructure
 
 - **`runner.odin`** - Main test runner that executes all tests
-- **`package.odin`** - Package declaration for test suite
 - **`build.sh`** - Build script for running tests
 
 ## Running Tests

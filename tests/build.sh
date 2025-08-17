@@ -13,6 +13,10 @@ tests=(
     "test_dates_times"
     "test_binary_custom"
     "test_struct_scanning"
+    "test_struct_advanced"
+    "test_json"
+    "test_custom_types"
+    "test_postgres_type"
 )
 
 build_count=0

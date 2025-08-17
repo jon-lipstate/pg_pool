@@ -15,7 +15,7 @@ import "core:sync"
 import "core:time"
 import dt "core:time/datetime"
 
-// Global / Singleton
+// GLOBAL POOL
 POOL: Connection_Pool
 
 Config :: struct {
@@ -62,17 +62,34 @@ Connection :: struct {
 	active_query_count: int, // Number of unreleased query results
 }
 
-// Postgres integers: 
-//
-// `INTEGER: i32`, `BIGINT: i64`, `SMALLINT: i16`. There are NO `uint` types. 
-//
+/*
+Initialize the global connection pool
+
+Creates a pool of PostgreSQL connections that are reused across queries.
+The pool maintains between min_connections and max_connections active connections.
+
+Inputs:
+- connection_string: PostgreSQL connection URL (e.g., "postgresql://user:pass@host/db")
+- min_connections: Minimum number of idle connections to maintain (default: 4)
+- max_connections: Maximum total connections allowed (default: 64)
+- max_idle_mins: Minutes before closing idle connections (default: 5)
+- total_cnx_memory: Total memory budget for all connection arenas (default: 16MB)
+- text_mode: Deprecated, not used (binary is default)
+- allocator: Memory allocator for pool structures (default: context.allocator)
+
+Returns:
+- err: Error if initialization fails
+
+Example:
+	err := pool.init("postgresql://localhost/mydb", min_connections = 2, max_connections = 10)
+	defer pool.destroy_pool()
+*/
 init :: proc(
 	connection_string: string,
 	min_connections: uint = 4,
 	max_connections: uint = 64,
 	max_idle_mins: uint = 5,
 	total_cnx_memory: uint = 16 * mem.Megabyte,
-	text_mode := true,
 	allocator := context.allocator,
 ) -> (
 	err: Error,
@@ -112,6 +129,20 @@ init :: proc(
 
 	return nil
 }
+
+/*
+Destroy the global connection pool and release all resources.
+
+Closes all active and idle connections, frees memory allocators.
+This should be called when the application shuts down.
+
+Returns:
+- nil on success
+- Error if cleanup fails
+
+Usage:
+    defer pool.destroy_pool()
+*/
 destroy_pool :: proc() -> Error {
 	context.allocator = POOL.base_allocator
 	destroy_config(&POOL.config)
@@ -226,6 +257,24 @@ set_connection_arena :: proc(cnx: ^Connection, allocation_size: uint) -> Error {
 	return nil
 }
 
+/*
+Acquire a connection from the pool.
+
+Returns an idle connection if available, or creates a new one if under max_size.
+The connection's arena is sized according to allocation_size.
+
+Inputs:
+- allocation_size: Size of the arena allocator for this connection (default: 16KB)
+
+Returns:
+- ^Connection: Active connection ready for use
+- Error: UnableToAcquireConnection if pool is exhausted or connection fails
+
+Usage:
+    cnx, err := pool.acquire()
+    if err != nil { return err }
+    defer pool.release(cnx)
+*/
 acquire :: proc(allocation_size: uint = 16 * mem.Kilobyte) -> (^Connection, Error) {
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
@@ -266,6 +315,19 @@ acquire :: proc(allocation_size: uint = 16 * mem.Kilobyte) -> (^Connection, Erro
 	return cnx, err
 }
 
+/*
+Release a connection back to the pool.
+
+Resets the connection state and returns it to the idle pool for reuse.
+Safe to call with nil connections (no-op).
+
+Inputs:
+- cnx: Connection to release
+
+Returns:
+- nil on success
+- Error if release fails
+*/
 release :: proc(cnx: ^Connection) -> Error {
 	if cnx == nil || cnx.cnx == nil {
 		// Already released or nil connection
@@ -381,6 +443,21 @@ Pool_Stats :: struct {
 	avg_last_used:      uint, // Average memory used in recent queries
 }
 
+/*
+Get current statistics about the connection pool.
+
+Provides insight into pool utilization and memory usage.
+
+Returns:
+- Pool_Stats containing:
+  - active_connections: Currently in use
+  - idle_connections: Available for use
+  - total_connections: Active + idle
+  - min_size/max_size: Pool size limits
+  - total_memory: Total allocated memory
+  - peak_memory_used: Maximum memory ever used
+  - avg_last_used: Average memory used in recent queries
+*/
 get_pool_stats :: proc() -> Pool_Stats {
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
@@ -426,7 +503,18 @@ get_pool_stats :: proc() -> Pool_Stats {
 	return stats
 }
 
-// Get memory info for a specific query result
+/*
+Get memory usage information for a specific query result.
+
+Useful for monitoring memory consumption of large result sets.
+
+Inputs:
+- rows: Query result to inspect
+
+Returns:
+- used: Bytes currently used by the result
+- allocated: Total bytes allocated for the connection arena
+*/
 get_query_memory :: proc(rows: ^Rows) -> (used: uint, allocated: uint) {
 	if rows.cnx != nil {
 		used = uint(rows.cnx.arena.offset)
@@ -435,7 +523,12 @@ get_query_memory :: proc(rows: ^Rows) -> (used: uint, allocated: uint) {
 	return
 }
 
-// Call for periodic pool maintainance 
+/*
+Perform periodic maintenance on the connection pool.
+
+Removes idle connections that have exceeded max_idle_time.
+Should be called periodically (e.g., every minute) to prevent stale connections.
+*/
 maintainance :: proc() {
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
@@ -448,6 +541,17 @@ maintainance :: proc() {
 	if !rebalance() {fmt.eprintln("failed to rebalance pool after health_check")}
 }
 
+/*
+Dynamically resize the connection pool limits.
+
+Adjusts minimum and maximum pool size and rebalances connections.
+
+Inputs:
+- new_min_size: New minimum number of idle connections
+- new_max_size: New maximum total connections
+
+Note: Will attempt to rebalance the pool to meet new requirements.
+*/
 resize_pool :: proc(new_min_size: int, new_max_size: int) {
 	sync.lock(&POOL.lock)
 	defer sync.unlock(&POOL.lock)
@@ -664,6 +768,19 @@ fetch_column_metadata :: proc(rows: ^Rows) {
 	}
 }
 
+/*
+Release resources associated with a query result.
+
+Frees the result set and decrements the connection's active query count.
+Should always be called when done with query results.
+
+Inputs:
+- rows: Query result to release
+
+Usage:
+    rows, err := pool.query("SELECT * FROM users")
+    defer pool.release_query(&rows)
+*/
 release_query :: proc(rows: ^Rows) {
 	if rows == nil {return}
 
@@ -675,22 +792,30 @@ release_query :: proc(rows: ^Rows) {
 	if rows.result != nil {
 		pq.clear(rows.result)
 	}
-	// delete(rows.columns) // not needed, part of arena
 	// Only release connection if we own it (acquired from pool for this query)
 	if rows.owns_connection {
 		release(rows.cnx)
 	}
 }
 
-// Advance to the next row. Must be called before first scan.
-// Usage:
-//   rows, _ := query("SELECT ...")
-//   defer release_query(&rows)
-//   for next_row(&rows) {
-//       val, _ := scan(&rows, int, 0)
-//   }
-// NOTE: scan() allocates strings/slices using context.allocator, not the connection's arena.
-//       Use an arena allocator in your handler for automatic cleanup.
+/*
+Advance to the next row in a query result set.
+
+**Must be called before scanning the first row**
+
+Inputs:
+- rows: Query result to advance
+
+Returns:
+- true if a row is available
+- false if no more rows
+
+Usage:
+    for pool.next_row(&rows) {
+        id, _ := pool.scan(&rows, int, 0)
+        // Process row...
+    }
+*/
 next_row :: proc(rows: ^Rows) -> (ok: bool) {
 	if rows.current_row >= rows.row_count - 1 {
 		return false
@@ -698,8 +823,48 @@ next_row :: proc(rows: ^Rows) -> (ok: bool) {
 	rows.current_row += 1
 	return true
 }
-// QueryRow-style API that returns a single row result into a struct
-// Usage: user := pool.query_row_into("SELECT * FROM users WHERE id = $1", User, args={1})
+
+/*
+Execute a query and scan the first row directly into a struct.
+
+Convenience function that combines query(), next_row(), and scan_into() for
+single-row queries. Automatically maps columns to struct fields using reflection.
+
+Inputs:
+- sql: SQL query string with optional $1, $2... placeholders
+- T: Struct type to scan into
+- cnx: Optional connection (uses pool if nil)
+- arena_size: Size for result arena (default: 16KB)
+- types: Optional type hints for parameters
+- args: Query parameters
+
+Returns:
+- result: Instance of T with fields populated from the row
+- err: NoRows if empty, or other query/scanning errors
+
+Field Mapping:
+- Uses `pg:"column_name"` tags to map columns to fields
+- Falls back to field name if no tag present
+- Supports basic types, time.Time, arrays, and pointers
+
+Usage:
+    User :: struct {
+        id:    int    `pg:"id"`,
+        email: string `pg:"email"`,
+        name:  string `pg:"name"`,
+    }
+    
+    user, err := pool.query_row_into(
+        "SELECT id, email, name FROM users WHERE id = $1",
+        User,
+        args = {42},
+    )
+    if err != nil { return err }
+    defer delete(user.email)
+    defer delete(user.name)
+
+Note: Caller must free allocated strings and slices in the returned struct
+*/
 query_row_into :: proc(
 	sql: string,
 	$T: typeid,
@@ -768,7 +933,35 @@ get_pg_columns :: proc(T: typeid) -> []PG_Col {
 	return pg_cols
 }
 
+/*
+Executes a query and returns a result set. The query uses binary format by default. Results must be released after use.
 
+*Uses Connection Arena for Allocations*
+
+Inputs:
+- sql: SQL query string with optional $1, $2... placeholders
+- cnx: Optional connection to use (default: acquires from pool)
+- arena_size: Size of arena for result data (default: 64KB)
+- types: Optional type hints for parameters
+- result_format: Binary or Text format (default: Binary)
+- args: Variadic arguments matching $1, $2... placeholders
+
+Returns:
+- Rows: Result set that must be released with release_query()
+- Error: Query execution error
+
+Example:
+	rows, err := pool.query("SELECT id, name FROM users WHERE age > $1", args = {18})
+	defer pool.release_query(&rows)
+	
+	for pool.next_row(&rows) {
+	    id, _ := pool.scan(&rows, int, 0)
+	    name, _ := pool.scan(&rows, string, 1)
+	    defer delete(name)
+	}
+
+Thread Safety: Connection should not be shared between threads
+*/
 query :: proc(
 	sql: string,
 	cnx: ^Connection = nil,
@@ -852,7 +1045,26 @@ query :: proc(
 	return rows, nil
 }
 
-// Helper for single-row queries
+/*
+Execute a query expected to return exactly one row.
+
+Convenience wrapper around query() for single-row results.
+
+Inputs:
+- sql: SQL query string
+- cnx: Optional connection (uses pool if nil)
+- arena_size: Size for result arena (default: 16KB)
+- types: Optional type hints for parameters
+- args: Query parameters
+
+Returns:
+- Rows: Result set positioned at first row
+- Error: Query error or NoRows if empty
+
+Usage:
+    row, err := pool.query_row("SELECT * FROM users WHERE id = $1", args = {42})
+    defer pool.release_query(&row)
+*/
 query_row :: proc(
 	sql: string,
 	cnx: ^Connection = nil,
@@ -876,7 +1088,26 @@ query_row :: proc(
 	return rows, nil
 }
 
-// Execute a query that doesn't return rows (INSERT/UPDATE/DELETE)
+/*
+Use for INSERT, UPDATE, DELETE, or DDL statements that don't return a result set.
+Returns the number of affected rows for DML statements.
+
+Inputs:
+- sql: SQL statement with optional $1, $2... placeholders
+- cnx: Optional connection to use (default: acquires from pool)
+- types: Optional type hints for parameters
+- args: Variadic arguments matching $1, $2... placeholders
+
+Returns:
+- affected_rows: Number of rows affected by the statement
+- err: Execution error
+
+Example:
+	affected, err := pool.exec("UPDATE users SET active = $1 WHERE age < $2", args = {false, 18})
+	fmt.printf("Updated %d users\n", affected)
+
+Thread Safety: Connection should not be shared between threads
+*/
 exec :: proc(
 	sql: string,
 	cnx: ^Connection = nil,
@@ -1001,7 +1232,27 @@ exec :: proc(
 	return 0, nil
 }
 
-// Begin a transaction, or create a savepoint if already in a transaction
+/*
+Begin a database transaction or create a savepoint.
+
+If no connection provided, acquires one and starts a transaction.
+If connection already in transaction, creates a nested savepoint.
+
+Inputs:
+- cnx: Optional existing connection (for nested transactions)
+
+Returns:
+- ^Connection: Connection with active transaction
+- Error: If transaction start fails
+
+Usage:
+    tx, err := pool.begin()
+    if err != nil { return err }
+    defer pool.rollback(tx)  // Safe to defer - no-op after commit
+    
+    // Do work...
+    pool.commit(tx)
+*/
 begin :: proc(cnx: ^Connection = nil) -> (^Connection, Error) {
 	if cnx == nil {
 		// New transaction - acquire connection and BEGIN
@@ -1050,7 +1301,19 @@ begin :: proc(cnx: ^Connection = nil) -> (^Connection, Error) {
 	}
 }
 
-// Commit a transaction or release a savepoint
+/*
+Commit a transaction or release a savepoint.
+
+For top-level transactions, commits all changes.
+For nested savepoints, releases the savepoint.
+
+Inputs:
+- cnx: Connection with active transaction
+
+Returns:
+- nil on success
+- Error if commit fails or not in transaction
+*/
 commit :: proc(cnx: ^Connection) -> Error {
 	if cnx == nil || cnx.cnx == nil {
 		return db_error(.ConnectionError, "Connection already released")
@@ -1087,8 +1350,22 @@ commit :: proc(cnx: ^Connection) -> Error {
 	return nil
 }
 
-// Rollback a transaction or to a savepoint
-// Safe to call after commit (will be a no-op)
+/*
+Rollback a transaction or to a savepoint.
+
+For top-level transactions, undoes all changes.
+For nested savepoints, rolls back to the savepoint.
+Safe to call after commit (no-op).
+
+Inputs:
+- cnx: Connection with active transaction
+
+Returns:
+- nil on success or if already committed
+- Error if rollback fails
+
+Note: Designed for defer pattern - always safe to defer.
+*/
 rollback :: proc(cnx: ^Connection) -> Error {
 	if cnx == nil || cnx.cnx == nil || !cnx.in_use_by_tx || cnx.transaction_depth == 0 {
 		return nil // Safe no-op for defer pattern

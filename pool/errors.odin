@@ -4,7 +4,7 @@ import pq "../vendor/odin-postgresql"
 import "core:mem"
 import "core:strings"
 
-
+// TODO: need cleanup here...
 db_error :: proc(kind: DB_Error_Kind, msg: string) -> Error {
 	db_err := new(DB_Error)
 	db_err^ = DB_Error {
@@ -49,6 +49,9 @@ QueryError :: enum {
 	PqErr,
 	NoRows,
 	UnexpectedNullValue,
+	InvalidFormat,
+	NotImplemented,
+	TypeMismatch,
 }
 
 PoolError :: enum {
