@@ -320,7 +320,7 @@ _, err := pool.exec(
 
 ### Custom Type Handlers
 
-Custom types support both writing (serialization) and reading (deserialization):
+Custom types support both serialization and deserialization:
 
 #### Writing Custom Types
 
@@ -333,7 +333,7 @@ uuid_writer := pool.Postgres_Type {
         uuid_str := arg.(string)
         p_bytes := transmute([]byte)uuid_str
         append(buf, ..p_bytes)
-        append(buf, 0) // null terminator for text format
+        append(buf, 0) // nul terminator for text format
         return i32(len(uuid_str))
     },
 }
@@ -378,60 +378,14 @@ if pool.next_row(&rows) {
 }
 ```
 
-### Available OID Constants
-
-Common PostgreSQL type OIDs are predefined:
-
-| Constant | OID | PostgreSQL Type |
-|----------|-----|-----------------|
-| `OID_INT2` | 21 | SMALLINT |
-| `OID_INT4` | 23 | INTEGER |
-| `OID_INT8` | 20 | BIGINT |
-| `OID_FLOAT4` | 700 | REAL |
-| `OID_FLOAT8` | 701 | DOUBLE PRECISION |
-| `OID_BOOL` | 16 | BOOLEAN |
-| `OID_TEXT` | 25 | TEXT |
-| `OID_VARCHAR` | 1043 | VARCHAR |
-| `OID_DATE` | 1082 | DATE |
-| `OID_TIMESTAMP` | 1114 | TIMESTAMP |
-| `OID_TIMESTAMPTZ` | 1184 | TIMESTAMPTZ |
-| `OID_INTERVAL` | 1186 | INTERVAL |
-| `OID_UUID` | 2950 | UUID |
-| `OID_NUMERIC` | 1700 | NUMERIC/DECIMAL |
-| `OID_JSON` | 114 | JSON |
-| `OID_JSONB` | 3802 | JSONB |
-| `OID_INET` | 869 | INET |
-| `OID_MONEY` | 790 | MONEY |
-
-Array type OIDs are also available (e.g., `OID_ARR_INT4`, `OID_ARR_TEXT`).
-
 ### When to Use Custom Types
 
 1. **Automatic type detection works for most cases** - The library automatically detects types for basic Odin types
 2. **Use Postgres_Type when you need:**
-   - Explicit binary format for better performance
-   - Custom types not directly supported (UUID, INET, geometric types)
+   - Explicit binary format
+   - Custom types not directly supported (INET, geometric types)
    - Override default type mapping behavior
    - Custom serialization logic
-
-### Performance Considerations
-
-Binary format typically offers better performance than text format:
-- Reduced parsing overhead
-- Smaller data transfer size for numeric types
-- Direct memory representation for many types
-
-```odin
-// Force all parameters to use binary format
-all_binary := proc(query: string, args: ..any) -> (Rows, Error) {
-    types := make([]pool.Postgres_Type, len(args))
-    for _, i in args {
-        types[i] = {format = .Binary}
-    }
-    defer delete(types)
-    return pool.query(query, types = types, args = args)
-}
-```
 
 ## Error Handling
 
@@ -468,4 +422,4 @@ case Query_Error:
 - Struct scanning doesn't support pointer fields
 - Some error conditions panic instead of returning errors
 - More testing/asserts
-- tprint is used extensively and not really cleaned up yet
+- tprint is used extensively and not really cleaned up yet; have not yet to decided path to go on this
