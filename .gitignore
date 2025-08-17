@@ -1,12 +1,12 @@
 *.exe
 *.pdb
-vendor/odin-postgresql/
+vendor/
 .env
 ols.json
 pg_pool
 .vscode
-jwt/
 out/
 pgx/
 .claude/
 pg_pool_test
+todos.md

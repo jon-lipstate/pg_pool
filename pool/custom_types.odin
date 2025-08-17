@@ -21,6 +21,11 @@ import "core:reflect"
 		OID:   pgtype.UUIDOID,
 	})
 */
+// TODO: add type hinting in the pg attr so type hints are available
+//   User :: struct {
+//       id: string `pg:"id:uuid"`,  // Hint that this should use UUID type
+//       addr: string `pg:"address:inet"`,  // INET type
+//   }
 buf_writer :: #type proc(buf: ^[dynamic]byte, arg: any, format: pq.Format) -> (size: i32)
 col_reader :: #type proc() -> any
 Type_Decl :: union {
@@ -72,6 +77,7 @@ OID_BYTEA :: 17
 OID_JSON :: 114
 OID_JSONB :: 3802 // req 0x1 prefix on values
 // array-types
+OID_ARR_BOOL :: 1000
 OID_ARR_INT2 :: 1005
 OID_ARR_INT4 :: 1007
 OID_ARR_INT8 :: 1016
@@ -81,3 +87,10 @@ OID_ARR_FLOAT8 :: 1022
 // 
 OID_TSVECTOR :: 3614
 OID_TSQUERY :: 3615
+
+OID_UUID :: 2950
+OID_NUMERIC :: 1700 // PostgreSQL DECIMAL is an alias for NUMERIC, same OID
+OID_INET :: 869
+OID_CIDR :: 650
+OID_MACADDR :: 829
+OID_MONEY :: 790

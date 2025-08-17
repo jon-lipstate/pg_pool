@@ -46,18 +46,20 @@ Connection_Pool :: struct {
 }
 
 Connection :: struct {
-	cnx:               pq.Conn,
-	created_at:        time.Time,
-	last_active:       time.Time,
-	arena:             mem.Arena,
-	allocator:         mem.Allocator,
+	cnx:                pq.Conn,
+	created_at:         time.Time,
+	last_active:        time.Time,
+	arena:              mem.Arena,
+	allocator:          mem.Allocator,
 	// Memory tracking
-	arena_size:        uint, // Total arena size allocated
-	peak_used:         uint, // High water mark for this connection
-	last_used:         uint, // Memory used by last query
+	arena_size:         uint, // Total arena size allocated
+	peak_used:          uint, // High water mark for this connection
+	last_used:          uint, // Memory used by last query
 	// Transaction state
-	transaction_depth: int, // 0 = no tx, 1 = BEGIN, 2+ = savepoints
-	in_use_by_tx:      bool, // True when connection is held by a transaction
+	transaction_depth:  int, // 0 = no tx, 1 = BEGIN, 2+ = savepoints
+	in_use_by_tx:       bool, // True when connection is held by a transaction
+	// Query tracking to prevent deadlocks
+	active_query_count: int, // Number of unreleased query results
 }
 
 // Postgres integers: 
@@ -113,7 +115,7 @@ init :: proc(
 destroy_pool :: proc() -> Error {
 	context.allocator = POOL.base_allocator
 	destroy_config(&POOL.config)
-	
+
 	// Free all connections directly without trying to remove from lists
 	for cnx in POOL.active_connections {
 		if cnx != nil && cnx.cnx != nil {
@@ -127,7 +129,7 @@ destroy_pool :: proc() -> Error {
 		}
 		free(cnx, POOL.base_allocator)
 	}
-	
+
 	delete(POOL.active_connections)
 	delete(POOL.idle_connections)
 	delete(POOL.cnx_backing)
@@ -232,12 +234,12 @@ acquire :: proc(allocation_size: uint = 16 * mem.Kilobyte) -> (^Connection, Erro
 		cnx := pop(&POOL.idle_connections)
 		time_elapsed := time.since(cnx.created_at)
 		if time_elapsed > POOL.max_life_time {
-			destroy_connection(cnx)
+			destroy_connection_unlocked(cnx) // Use unlocked version since we hold lock
 			continue
 		}
 		append(&POOL.active_connections, cnx)
 		cnx.last_active = time.now()
-		err := set_connection_arena(cnx, allocation_size)
+		err := set_connection_arena(cnx, allocation_size) // Still inside lock
 		return cnx, err
 	}
 
@@ -488,90 +490,6 @@ Column_Metadata :: struct {
 	text_mode: bool,
 }
 
-
-query :: proc(
-	sql: string,
-	cnx: ^Connection = nil,
-	arena_size: uint = 64 * mem.Kilobyte,
-	types: []Postgres_Type = nil,
-	args: ..any,
-) -> (
-	Rows,
-	Error,
-) {
-	// Check if connection was already released
-	if cnx != nil && cnx.cnx == nil {
-		return {}, db_error(.ConnectionError, "Connection already released")
-	}
-
-	should_release := false
-	actual_cnx := cnx
-	if actual_cnx == nil {
-		// No connection provided, acquire from pool
-		err: Error
-		actual_cnx, err = acquire(arena_size)
-		if err != nil {
-			fmt.eprintln("query error:", err)
-			return {}, .FailedToAcquireConnection
-		}
-		should_release = true
-	} else {
-		actual_cnx = cnx
-	}
-
-	// Always use the connection's arena allocator
-	context.allocator = actual_cnx.allocator
-
-	c_sql := strings.clone_to_cstring(sql)
-	n_args := count_args(sql)
-	ep := make_exec_params(n_args)
-	defer delete_exec_params(&ep)
-
-	for arg, i in args {
-		type := types != nil ? &types[i] : nil
-		set_exec_param(&ep, i, arg, type)
-	}
-
-	p_types := n_args > 0 ? &ep.types[0] : nil
-	p_lens := n_args > 0 ? &ep.lengths[0] : nil
-	p_formats := n_args > 0 ? &ep.formats[0] : nil
-	value_ptrs := get_value_ptrs(ep.values, ep.lengths)
-	p_values := n_args > 0 ? transmute([^][^]byte)&value_ptrs[0] : nil
-	defer if value_ptrs != nil {delete(value_ptrs)}
-
-	result := pq.exec_params(
-		actual_cnx.cnx,
-		c_sql,
-		i32(n_args),
-		p_types,
-		p_values,
-		p_lens,
-		p_formats,
-		.Text,
-	) // FIXME: SWITCH TO BINARY RETURNS
-
-	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
-		err := db_error_from_msg(actual_cnx)
-		if should_release {
-			release(actual_cnx)
-		}
-		return {}, err
-	}
-
-	rows, rows_err := result_into_rows(actual_cnx, result)
-	if rows_err != nil {
-		if should_release {
-			release(actual_cnx)
-		}
-		return {}, rows_err
-	}
-	// If we acquired from pool, mark rows to release connection when done
-	if should_release {
-		rows.owns_connection = true
-	}
-	return rows, nil
-}
-
 Exec_Params :: struct {
 	types:   []pq.OID,
 	values:  [dynamic]byte, // this is backing buffer; exec_params uses [] of ptrs
@@ -624,6 +542,7 @@ set_exec_param :: proc(
 get_value_ptrs :: proc(
 	backing: [dynamic]byte,
 	lens: []i32,
+	formats: []pq.Format = nil,
 	allocator := context.allocator,
 ) -> [][^]byte {
 	if len(lens) == 0 {
@@ -642,7 +561,9 @@ get_value_ptrs :: proc(
 			// PostgreSQL distinguishes between NULL and empty string
 			if offset < len(backing) {
 				buf[i] = &backing[offset]
-				offset += 1 // Just the null terminator
+				// Text format has null terminator, binary doesn't
+				is_text := formats == nil || formats[i] == .Text
+				offset += 1 if is_text else 0
 			} else {
 				buf[i] = nil
 			}
@@ -660,9 +581,9 @@ get_value_ptrs :: proc(
 				panic("Buffer overflow in get_value_ptrs")
 			}
 			buf[i] = &backing[offset]
-			// Skip past the data AND the null terminator for text format
-			// The length doesn't include the null terminator, but it's in the buffer
-			offset += int(length) + 1 // +1 for null terminator
+			// Text format has null terminator, binary doesn't
+			is_text := formats == nil || formats[i] == .Text
+			offset += int(length) + (1 if is_text else 0)
 		}
 	}
 
@@ -699,6 +620,9 @@ extract_oids :: proc(types: []Type_Decl) -> []pq.OID {
 @(private)
 result_into_rows :: proc(cnx: ^Connection, result: pq.Result) -> (rows: Rows, err: Error) {
 	row_count := int(pq.n_tuples(result))
+
+	// Track active query on the connection
+	cnx.active_query_count += 1
 
 	columns := make([]Column_Metadata, int(pq.n_fields(result)))
 
@@ -742,6 +666,12 @@ fetch_column_metadata :: proc(rows: ^Rows) {
 
 release_query :: proc(rows: ^Rows) {
 	if rows == nil {return}
+
+	// Decrement active query count on the connection
+	if rows.cnx != nil {
+		rows.cnx.active_query_count -= 1
+	}
+
 	if rows.result != nil {
 		pq.clear(rows.result)
 	}
@@ -839,6 +769,89 @@ get_pg_columns :: proc(T: typeid) -> []PG_Col {
 }
 
 
+query :: proc(
+	sql: string,
+	cnx: ^Connection = nil,
+	arena_size: uint = 64 * mem.Kilobyte,
+	types: []Postgres_Type = nil,
+	result_format: pq.Format = .Binary,
+	args: ..any,
+) -> (
+	Rows,
+	Error,
+) {
+	// Check if connection was already released
+	if cnx != nil && cnx.cnx == nil {
+		return {}, db_error(.ConnectionError, "Connection already released")
+	}
+
+	should_release := false
+	actual_cnx := cnx
+	if actual_cnx == nil {
+		// No connection provided, acquire from pool
+		err: Error
+		actual_cnx, err = acquire(arena_size)
+		if err != nil {
+			fmt.eprintln("query error:", err)
+			return {}, .FailedToAcquireConnection
+		}
+		should_release = true
+	} else {
+		actual_cnx = cnx
+	}
+
+	// Always use the connection's arena allocator
+	context.allocator = actual_cnx.allocator
+
+	c_sql := strings.clone_to_cstring(sql)
+	n_args := count_args(sql)
+	ep := make_exec_params(n_args)
+	defer delete_exec_params(&ep)
+
+	for arg, i in args {
+		type := types != nil ? &types[i] : nil
+		set_exec_param(&ep, i, arg, type)
+	}
+
+	p_types := n_args > 0 ? &ep.types[0] : nil
+	p_lens := n_args > 0 ? &ep.lengths[0] : nil
+	p_formats := n_args > 0 ? &ep.formats[0] : nil
+	value_ptrs := get_value_ptrs(ep.values, ep.lengths, ep.formats)
+	p_values := n_args > 0 ? transmute([^][^]byte)&value_ptrs[0] : nil
+	defer if value_ptrs != nil {delete(value_ptrs)}
+
+	result := pq.exec_params(
+		actual_cnx.cnx,
+		c_sql,
+		i32(n_args),
+		p_types,
+		p_values,
+		p_lens,
+		p_formats,
+		result_format,
+	)
+
+	if result == nil || pq.result_status(result) != pq.Exec_Status.Tuples_OK {
+		err := db_error_from_msg(actual_cnx)
+		if should_release {
+			release(actual_cnx)
+		}
+		return {}, err
+	}
+
+	rows, rows_err := result_into_rows(actual_cnx, result)
+	if rows_err != nil {
+		if should_release {
+			release(actual_cnx)
+		}
+		return {}, rows_err
+	}
+	// If we acquired from pool, mark rows to release connection when done
+	rows.owns_connection = should_release
+
+	return rows, nil
+}
+
 // Helper for single-row queries
 query_row :: proc(
 	sql: string,
@@ -891,6 +904,49 @@ exec :: proc(
 		defer if should_release {release(actual_cnx)}
 	} else {
 		actual_cnx = cnx
+		// Only warn for potentially dangerous operations, not normal DML in transactions
+		if actual_cnx.active_query_count > 0 {
+			// Check if this looks like a command that could cause deadlocks or issues
+			sql_upper := strings.to_upper(strings.trim_space(sql), context.temp_allocator)
+
+			// DDL commands that can lock tables
+			is_ddl :=
+				strings.has_prefix(sql_upper, "DROP") ||
+				strings.has_prefix(sql_upper, "CREATE") ||
+				strings.has_prefix(sql_upper, "ALTER") ||
+				strings.has_prefix(sql_upper, "TRUNCATE") ||
+				strings.has_prefix(sql_upper, "VACUUM") ||
+				strings.has_prefix(sql_upper, "REINDEX") ||
+				strings.has_prefix(sql_upper, "CLUSTER")
+
+			// SET commands that affect transaction state (but not session settings like timezone)
+			is_problematic_set :=
+				strings.has_prefix(sql_upper, "SET TRANSACTION") ||
+				strings.has_prefix(sql_upper, "SET CONSTRAINTS")
+
+			if is_ddl {
+				fmt.eprintln(
+					"WARNING: Executing DDL command while there are",
+					actual_cnx.active_query_count,
+					"unreleased query results. This may cause deadlocks.",
+				)
+				fmt.eprintln(
+					"         Make sure to call pool.release_query() before DDL commands.",
+				)
+			}
+
+			when ODIN_DEBUG {
+				// Only warn about these in debug mode as they're less critical
+				if is_problematic_set {
+					fmt.eprintln(
+						"DEBUG WARNING: Executing SET command that affects transaction state while there are",
+						actual_cnx.active_query_count,
+						"unreleased query results.",
+					)
+					fmt.eprintln("              This may cause unexpected behavior.")
+				}
+			}
+		}
 	}
 
 	// Always use the connection's arena allocator
@@ -909,7 +965,7 @@ exec :: proc(
 	p_types := n_args > 0 ? &ep.types[0] : nil
 	p_lens := n_args > 0 ? &ep.lengths[0] : nil
 	p_formats := n_args > 0 ? &ep.formats[0] : nil
-	value_ptrs := get_value_ptrs(ep.values, ep.lengths)
+	value_ptrs := get_value_ptrs(ep.values, ep.lengths, ep.formats)
 	p_values := n_args > 0 ? transmute([^][^]byte)&value_ptrs[0] : nil
 	defer if value_ptrs != nil {delete(value_ptrs)}
 

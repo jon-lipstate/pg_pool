@@ -95,7 +95,7 @@ exec_prepared :: proc(
 
 	p_lens := n_args > 0 ? &pd.lengths[0] : nil
 	p_formats := n_args > 0 ? &pd.formats[0] : nil
-	value_ptrs := get_value_ptrs(pd.values, pd.lengths)
+	value_ptrs := get_value_ptrs(pd.values, pd.lengths, pd.formats)
 	p_values := n_args > 0 ? transmute([^][^]byte)&value_ptrs[0] : nil
 	defer if value_ptrs != nil {delete(value_ptrs)}
 
