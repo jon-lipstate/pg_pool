@@ -1213,14 +1213,14 @@ exec :: proc(
 	)
 
 	if result == nil {
-		err = db_error_from_msg(cnx)
+		err = db_error_from_msg(actual_cnx)
 		return 0, err
 	}
 	defer pq.clear(result)
 
 	status := pq.result_status(result)
 	if status != pq.Exec_Status.Command_OK {
-		err = db_error_from_msg(cnx)
+		err = db_error_from_msg(actual_cnx)
 		return 0, err
 	}
 
