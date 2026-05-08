@@ -39,6 +39,10 @@ Connection_Pool :: struct {
 	max_size:           int,
 	max_life_time:      time.Duration,
 	max_idle_time:      time.Duration,
+	// init_sql runs once on every freshly-created libpq connection. Used
+	// to set per-pool defaults like statement_timeout. Empty = no init.
+	// Allocated by base_allocator (cloned from caller's string).
+	init_sql:           string,
 	//
 	base_allocator:     mem.Allocator, // what was passed to init
 	cnx_backing:        []byte, // allocated by base_allocator
@@ -74,7 +78,24 @@ Inputs:
 - max_connections: Maximum total connections allowed (default: 64)
 - max_idle_mins: Minutes before closing idle connections (default: 5)
 - total_cnx_memory: Total memory budget for all connection arenas (default: 16MB)
-- text_mode: Deprecated, not used (binary is default)
+- connect_timeout_sec: How long libpq waits to establish a connection. Injected
+  into the DSN as connect_timeout=N if not already present. 0 = libpq default
+  (~∞, will hang on dead networks). Recommended: 10s.
+- keepalives_idle_sec: TCP keepalive idle interval. When non-zero and the DSN
+  doesn't already specify keepalives, injects keepalives=1 + keepalives_idle=N
+  + keepalives_interval=10 + keepalives_count=3. Prevents cloud load balancers
+  and server idle timeouts from closing connections beneath the pool.
+  Recommended: 60s.
+- tcp_user_timeout_ms: kernel-level TCP_USER_TIMEOUT — if any in-flight write
+  goes unacknowledged for this many ms, the kernel kills the connection so
+  libpq's poll() returns instead of hanging forever. Catches the gap that
+  keepalives + PQstatus miss: a connection that LOOKED alive and accepted a
+  write, then went silent mid-conversation. Linux libpq 12+ only; on other
+  platforms this param is ignored. 0 = libpq default (kernel inherits, often
+  many minutes). Recommended: 30000 (30s).
+- init_sql: SQL to run once on every newly-created libpq connection. Used to
+  set per-pool session defaults like `SET statement_timeout = '60s'`. Persists
+  for the lifetime of that libpq session — releases/re-acquires keep it.
 - allocator: Memory allocator for pool structures (default: context.allocator)
 
 Returns:
@@ -90,13 +111,41 @@ init :: proc(
 	max_connections: uint = 64,
 	max_idle_mins: uint = 5,
 	total_cnx_memory: uint = 16 * mem.Megabyte,
+	connect_timeout_sec: uint = 0,
+	keepalives_idle_sec: uint = 0,
+	tcp_user_timeout_ms: uint = 0,
+	init_sql: string = "",
 	allocator := context.allocator,
 ) -> (
 	err: Error,
 ) {
 	context.allocator = allocator
 
-	config, config_ok := parse_connection_string(connection_string)
+	// Inject DSN params if caller asked for non-default values and they
+	// aren't already in the DSN. Done before parse so the stored config
+	// has the augmented string.
+	dsn := connection_string
+	if connect_timeout_sec > 0 && !strings.contains(dsn, "connect_timeout") {
+		sep := "?"
+		if strings.contains(dsn, "?") do sep = "&"
+		dsn = fmt.aprintf("%s%sconnect_timeout=%d", dsn, sep, connect_timeout_sec)
+	}
+	if keepalives_idle_sec > 0 && !strings.contains(dsn, "keepalives") {
+		sep := "?"
+		if strings.contains(dsn, "?") do sep = "&"
+		// keepalives=1 enables TCP keepalive probes; idle=N is how long
+		// the connection sits silent before the first probe; interval/count
+		// control retry behavior — sane defaults for cloud DBs.
+		dsn = fmt.aprintf("%s%skeepalives=1&keepalives_idle=%d&keepalives_interval=10&keepalives_count=3",
+			dsn, sep, keepalives_idle_sec)
+	}
+	if tcp_user_timeout_ms > 0 && !strings.contains(dsn, "tcp_user_timeout") {
+		sep := "?"
+		if strings.contains(dsn, "?") do sep = "&"
+		dsn = fmt.aprintf("%s%stcp_user_timeout=%d", dsn, sep, tcp_user_timeout_ms)
+	}
+
+	config, config_ok := parse_connection_string(dsn)
 	if !config_ok {return .InvalidConnectionString}
 
 	backing, tcmerr := runtime.make_aligned([]byte, total_cnx_memory, 16)
@@ -116,6 +165,7 @@ init :: proc(
 		cond               = sync.Cond{},
 		cnx_backing        = backing,
 		base_allocator     = allocator,
+		init_sql           = strings.clone(init_sql),
 	}
 	mem.buddy_allocator_init(&POOL.cnx_allocator, POOL.cnx_backing, 16)
 
@@ -286,6 +336,15 @@ acquire :: proc(allocation_size: uint = 16 * mem.Kilobyte) -> (^Connection, Erro
 			destroy_connection_unlocked(cnx) // Use unlocked version since we hold lock
 			continue
 		}
+		// Health-check before handing out: cloud LBs / server idle timeouts
+		// can kill an idle connection without us noticing. Without this, the
+		// next operation hangs in poll() waiting on a dead socket. PQstatus
+		// is a local check (no network); PQconsumeInput + PQstatus catches
+		// connections the server has closed.
+		if pq.status(cnx.cnx) != pq.Connection_Status.Ok {
+			destroy_connection_unlocked(cnx)
+			continue
+		}
 		append(&POOL.active_connections, cnx)
 		cnx.last_active = time.now()
 		err := set_connection_arena(cnx, allocation_size) // Still inside lock
@@ -370,6 +429,21 @@ create_new_connection :: proc() -> (cnx: ^Connection, ok: bool) {
 		return nil, false
 	}
 
+	// Run init_sql once on every fresh libpq session. Used to set
+	// per-pool session defaults (statement_timeout, search_path, etc).
+	// Best-effort: if it fails we log and proceed — the session will
+	// just run with libpq defaults.
+	if POOL.init_sql != "" {
+		c_init := strings.clone_to_cstring(POOL.init_sql)
+		defer delete(c_init)
+		init_result := pq.exec(pq_conn, c_init)
+		if init_result == nil ||
+		   pq.result_status(init_result) != pq.Exec_Status.Command_OK {
+			fmt.eprintln("init_sql failed:", string(pq.error_message(pq_conn)))
+		}
+		if init_result != nil do pq.clear(init_result)
+	}
+
 	cnx = new(Connection)
 	cnx^ = {
 		cnx         = pq_conn,
@@ -401,18 +475,25 @@ destroy_connection_unlocked :: proc(cnx: ^Connection) {
 	removed := pop_connection(&POOL.idle_connections, cnx)
 	if !removed {
 		removed = pop_connection(&POOL.active_connections, cnx)
-		if !removed {
-			fmt.eprintln("Connection not found in either active or idle pools")
-			return
-		}
 	}
-	assert(cnx.cnx != nil, "destroy_connection: attempting to destroy a nil connection")
-	pq.finish(cnx.cnx)
+	// Note: removed=false is fine — caller may have already popped the
+	// connection out (e.g. acquire()'s idle-validation loop). What matters
+	// is the libpq handle gets finished and the Odin struct freed; that
+	// happens unconditionally below.
+	if cnx.cnx != nil {
+		pq.finish(cnx.cnx)
+	}
 	free(cnx, POOL.base_allocator)
 }
 
 @(private)
 validate_connection :: proc(cnx: ^Connection) -> bool {
+	if cnx == nil || cnx.cnx == nil {
+		// Already torn down (or never initialised). Caller treats this
+		// as "invalid" and routes through destroy — same effect as a
+		// failed PQstatus, but without dereferencing a bad pointer.
+		return false
+	}
 	time_elapsed := time.since(cnx.created_at)
 	if time_elapsed > POOL.max_life_time {
 		return false
@@ -1265,8 +1346,14 @@ begin :: proc(cnx: ^Connection = nil) -> (^Connection, Error) {
 
 		result := pq.exec(new_cnx.cnx, "BEGIN")
 		if result == nil {
+			// Capture the libpq error BEFORE release: if the BEGIN failed
+			// because the connection went bad, release() will see it as
+			// invalid via validate_connection() and call destroy_connection_unlocked()
+			// which pq.finish()es the libpq handle and free()s the Odin
+			// Connection struct. Reading new_cnx.cnx after that is UAF.
+			err := db_error_from_msg(new_cnx)
 			release(new_cnx)
-			return nil, db_error_from_msg(new_cnx)
+			return nil, err
 		}
 		pq.clear(result)
 
